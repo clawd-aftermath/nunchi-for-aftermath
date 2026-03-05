@@ -11,6 +11,7 @@ const httpProxy = require("http-proxy");
 const { bootstrap } = require("./bootstrap.mjs");
 const { startGateway, waitForGatewayReady, getGatewayProcess } = require("./gateway");
 const { autoOnboard } = require("./onboard");
+const { readStatus, readStrategies } = require("./status");
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "8080", 10);
@@ -43,7 +44,17 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Trading status (calls hl CLI directly)
+// CORS middleware for /api/* routes
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+app.use("/api", (req, res, next) => {
+  res.header("Access-Control-Allow-Origin", CORS_ORIGIN);
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// Trading status (human-readable, calls hl CLI directly)
 app.get("/status", async (req, res) => {
   const { execSync } = require("child_process");
   try {
@@ -55,6 +66,90 @@ app.get("/status", async (req, res) => {
     res.type("text/plain").send(output);
   } catch (e) {
     res.type("text/plain").send(e.stdout || e.stderr || e.message);
+  }
+});
+
+// API: Agent status (JSON, for UI)
+app.get("/api/status", (req, res) => {
+  res.json(readStatus());
+});
+
+// API: Strategy catalog
+app.get("/api/strategies", (req, res) => {
+  res.json(readStrategies());
+});
+
+// API: SSE feed — polls status every 2s
+app.get("/api/feed", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    Connection: "keep-alive",
+  });
+
+  let lastTick = -1;
+  const interval = setInterval(() => {
+    try {
+      const status = readStatus();
+      const tick = status.tick_count || 0;
+      if (tick !== lastTick) {
+        lastTick = tick;
+        res.write(`data: ${JSON.stringify(status)}\n\n`);
+      }
+    } catch {
+      // ignore read errors
+    }
+  }, 2000);
+
+  req.on("close", () => clearInterval(interval));
+});
+
+// API: Install/update Nunchi trading skill
+app.post("/api/skill/install", express.json(), (req, res) => {
+  const { execSync } = require("child_process");
+  try {
+    // Verify agent-cli is available by checking strategies
+    const output = execSync("python3 -m cli.api.status_reader strategies", {
+      timeout: 10000,
+      encoding: "utf-8",
+      cwd: "/agent-cli",
+    });
+    const data = JSON.parse(output.trim());
+    const count = Object.keys(data.strategies || {}).length;
+    res.json({ installed: true, strategies: count, tools: 13 });
+  } catch (e) {
+    res.status(500).json({ installed: false, error: e.message });
+  }
+});
+
+// API: Pause agent
+app.post("/api/pause", (req, res) => {
+  const gw = getGatewayProcess();
+  if (gw && !gw.killed) {
+    try {
+      process.kill(gw.pid, "SIGSTOP");
+      res.json({ status: "paused" });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  } else {
+    res.status(409).json({ error: "No running agent to pause" });
+  }
+});
+
+// API: Resume agent
+app.post("/api/resume", (req, res) => {
+  const gw = getGatewayProcess();
+  if (gw && !gw.killed) {
+    try {
+      process.kill(gw.pid, "SIGCONT");
+      res.json({ status: "resumed" });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  } else {
+    res.status(409).json({ error: "No paused agent to resume" });
   }
 });
 
