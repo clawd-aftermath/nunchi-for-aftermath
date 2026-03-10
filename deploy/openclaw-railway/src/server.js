@@ -197,11 +197,11 @@ app.get("/api/reflect", (req, res) => {
   }
 });
 
-// API: Scanner history
+// API: RADAR (scanner) history
 app.get("/api/scanner", (req, res) => {
   try {
     const output = execSync(
-      `python3 -m cli.api.status_reader scanner --data-dir ${DATA_DIR}`,
+      `python3 -m cli.api.status_reader radar --data-dir ${DATA_DIR}`,
       { timeout: 10000, encoding: "utf-8", cwd: AGENT_CLI_DIR, stdio: ["pipe", "pipe", "pipe"] }
     );
     res.json(JSON.parse(output.trim()));
