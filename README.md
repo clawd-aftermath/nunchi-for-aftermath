@@ -19,7 +19,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white" alt="Python" />
   <img src="https://img.shields.io/badge/strategies-14-C9A84C" alt="Strategies" />
-  <img src="https://img.shields.io/badge/tests-263%20passing-brightgreen" alt="Tests" />
+  <img src="https://img.shields.io/badge/tests-483%20passing-brightgreen" alt="Tests" />
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License" />
   <img src="https://img.shields.io/badge/MCP-16%20tools-8A2BE2" alt="MCP" />
 </p>
@@ -209,8 +209,8 @@ hl run avellaneda_mm --mock --max-ticks 3  # Step 6: Validate
 Trailing stop system with tiered profit-locking. Protects profits while letting winners run.
 
 **Two phases:**
-- **Phase 1 (Let it breathe)** — Wide retrace tolerance while position builds
-- **Phase 2 (Lock the bag)** — Tiered profit floors that ratchet up as ROE grows
+- **Phase 1 (Let it breathe)** — Wide retrace tolerance while position builds. Auto-cut at 90 min if no graduation; weak-peak early cut at 45 min if peak ROE < 3%.
+- **Phase 2 (Lock the bag)** — Tiered profit floors that ratchet up as ROE grows. Exchange-level stop loss synced to Hyperliquid as crash safety net.
 
 | Preset | Phase 1 Retrace | Tiers | Stagnation TP |
 |--------|----------------|-------|---------------|
@@ -249,12 +249,18 @@ hl radar run --mock     # Continuous (every 15 min)
 
 Detects assets with sudden capital inflow using OI, volume, funding, and price signals. Runs every 60 seconds.
 
-| Signal | Trigger | Confidence |
-|--------|---------|------------|
-| `IMMEDIATE_MOVER` | OI +15% AND volume 5x surge | 100 |
-| `VOLUME_SURGE` | 4h volume / average > 3x | 70 |
-| `OI_BREAKOUT` | OI jumps 8%+ above baseline | 60 |
-| `FUNDING_FLIP` | Funding rate reverses or accelerates 50%+ | 50 |
+**5-tier signal taxonomy** for entry classification, plus informational signals for Radar scoring:
+
+| Tier | Signal | Trigger | Confidence |
+|------|--------|---------|------------|
+| 1 | `FIRST_JUMP` | First asset in sector with OI + volume breakout | 100 |
+| 2 | `CONTRIB_EXPLOSION` | OI +15% **AND** volume 5x (simultaneous extreme) | 95 |
+| 3 | `IMMEDIATE_MOVER` | OI +15% **OR** volume 5x (either extreme) | 80 |
+| 4 | `NEW_ENTRY_DEEP` | OI grows 8%+ but volume stays low — smart money accumulation | 65 |
+| 5 | `DEEP_CLIMBER` | Sustained OI climb 5%+ per window over 3+ consecutive scans | 55 |
+| — | `VOLUME_SURGE` | 4h volume / average > 3x | 70 |
+| — | `OI_BREAKOUT` | OI jumps 8%+ above baseline | 60 |
+| — | `FUNDING_FLIP` | Funding rate reverses or accelerates 50%+ | 50 |
 
 ```bash
 hl pulse once --mock      # Single scan
@@ -274,13 +280,17 @@ The top-level orchestrator. Composes Radar + Pulse + Guard into a single autonom
 - Every 5 ticks: Watchdog health check
 - Every 15 ticks: Run opportunity radar
 
-**Entry priority:**
+**Entry priority** (tier-based):
 
 | Priority | Source | Condition |
 |----------|--------|-----------|
-| 1 | Movers IMMEDIATE | Auto-enter on compound OI + volume signal |
-| 2 | Radar | Score > 170 |
-| 3 | Movers signal | Confidence > 70 |
+| 1 | FIRST_JUMP | First sector mover (tier 1) |
+| 2 | CONTRIB_EXPLOSION | Simultaneous extreme OI + volume (tier 2) |
+| 3 | Smart money | Pulse confidence > 90 |
+| 4 | IMMEDIATE_MOVER | Either extreme metric (tier 3) |
+| 5 | Radar | Score > 170 |
+| 6 | NEW_ENTRY_DEEP | Limit-order accumulation (tier 4) |
+| 7 | DEEP_CLIMBER | Sustained OI trend (tier 5) |
 
 **Presets:**
 
@@ -341,6 +351,96 @@ All adjustments have guardrail bounds — parameters can't swing wildly. Disable
 
 ---
 
+### Production Safety
+
+Built-in safety systems that protect positions even when the runner process crashes.
+
+#### Exchange-Level Stop Loss Sync
+
+Guard places a **trigger order directly on Hyperliquid** as a safety net. If the runner crashes, the exchange-side stop loss remains active. Synced on entry, tier ratchet, and startup — intentionally left in place on shutdown.
+
+```
+Position Entry → Place SL trigger order at Phase 1 floor
+Tier Ratchet   → Cancel old SL, place new at higher tier floor
+Position Close → Cancel SL trigger order
+Runner Crash   → Exchange SL stays active (that's the point)
+```
+
+#### Clearinghouse Reconciliation
+
+Bidirectional reconciliation between APEX slots and Hyperliquid positions. Detects orphaned exchange positions, orphaned slots, and size mismatches. Runs on startup and periodically via watchdog.
+
+```bash
+hl apex reconcile             # Check for discrepancies
+hl apex reconcile --fix       # Auto-adopt orphans, fix sizes
+```
+
+| Discrepancy | Severity | Auto-Fix |
+|-------------|----------|----------|
+| Orphan exchange position | Critical | Adopt into empty slot + create Guard |
+| Orphan slot (no position) | Warning | Mark slot closed |
+| Size mismatch >10% | Critical | Update slot to match exchange |
+
+#### Risk Guardian
+
+Graduated risk response with three states and automatic transitions:
+
+```
+OPEN ──(2 consecutive losses)──→ COOLDOWN ──(trigger again)──→ CLOSED
+  ↑                                  │                            │
+  └──────(auto-expiry 30 min)────────┘                            │
+  └────────────────────(daily reset)──────────────────────────────┘
+```
+
+| State | Entries | Exits | Trigger |
+|-------|---------|-------|---------|
+| `OPEN` | Allowed | Allowed | Default |
+| `COOLDOWN` | **Blocked** | Allowed | 2+ consecutive losses or drawdown >= 50% of limit |
+| `CLOSED` | **Blocked** | **Blocked** | Daily loss limit hit |
+
+Exchange-level stop losses remain active in all states.
+
+#### Rotation Cooldown
+
+Anti-churn protection:
+- **Minimum hold (45 min)** — Conviction collapse and stagnation exits blocked until 45 min. Guard hard stops and daily loss still override.
+- **Slot cooldown (5 min)** — Closed slots can't be reused for 5 minutes.
+
+#### State Archiving
+
+Closed position state files archived to `data/archive/{YYYY-MM-DD}/` on close. Trade audit trail (`trades.jsonl`) is never archived.
+
+```bash
+hl apex archive               # Archive all closed state files
+hl apex archive --days 7      # Only older than 7 days
+hl apex archive --dry-run     # Preview without moving
+```
+
+#### ALO Fee Optimization
+
+Entry orders default to **ALO (post-only)** for maker rebates (~3 bps savings per round-trip). Falls back to GTC if ALO is rejected. Exits and Guard closes always use IOC.
+
+---
+
+### Autoresearch-Powered REFLECT
+
+Connects REFLECT to an autonomous optimization loop. A backtest harness replays historical trades against config variants, and an iterative agent loop finds parameter improvements.
+
+```bash
+python3 scripts/backtest_apex.py --config apex_config.json --trades data/cli/trades.jsonl
+```
+
+REFLECT auto-generates research directions:
+
+| Finding | Suggested Direction |
+|---------|-------------------|
+| FDR > 30% | Raise `radar_score_threshold` in [170, 250] |
+| Win rate < 40% | Sweep `pulse_confidence_threshold` in [70, 95] |
+| Direction imbalance | Set `max_same_direction` to 1 |
+| Healthy + profitable | Try lowering `radar_score_threshold` in [140, 170] |
+
+---
+
 ## Commands
 
 ```bash
@@ -354,6 +454,8 @@ hl skills list                    # Discover installed skills
 
 # Autonomous stack
 hl apex run [options]             # APEX multi-slot orchestrator
+hl apex reconcile [--fix]         # Reconcile state vs exchange
+hl apex archive [--days N]        # Archive closed state files
 hl radar run [options]            # Opportunity radar
 hl pulse run [options]            # Pulse momentum detector
 hl guard run -i ETH-PERP [options] # Guard trailing stop
@@ -479,9 +581,11 @@ strategies/    14 trading strategy implementations
 modules/       Pure logic modules (zero I/O)
   apex_engine.py     APEX decision engine
   radar_engine.py    Opportunity radar
-  pulse_engine.py    Pulse momentum detector
-  trailing_stop.py   Guard trailing stop
-  reflect_engine.py     Performance analysis
+  pulse_engine.py    Pulse momentum detector (5-tier signal taxonomy)
+  trailing_stop.py   Guard trailing stop (Phase 1 auto-cut)
+  reflect_engine.py  Performance analysis
+  reconciliation.py  Clearinghouse reconciliation engine
+  archiver.py        State file archiving
 skills/        Agent Skills (SKILL.md + runners)
   onboard/     First-time setup guide
   apex/        APEX orchestrator
@@ -491,7 +595,8 @@ skills/        Agent Skills (SKILL.md + runners)
   reflect/        Performance review
 sdk/           Strategy base class and model registry
 parent/        HL API proxy, position tracking, risk management
-tests/         Test suite (263 tests)
+scripts/       Backtest harness, bootstrap
+tests/         Test suite (483 tests)
 ```
 
 ---
@@ -555,7 +660,7 @@ hl run my_strategies.my_strategy:MyStrategy -i ETH-PERP --tick 10
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/ -v                  # 263 tests
+pytest tests/ -v                  # 483 tests
 ```
 
 ## Attribution 
