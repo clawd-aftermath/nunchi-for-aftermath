@@ -50,6 +50,10 @@ class OrderManager:
         """Full tick cycle: cancel open orders -> TWAP slices -> place new -> return fills."""
         fills: List[HLFill] = []
 
+        # Atomic cancel-and-place fast path (Aftermath-style proxies)
+        if hasattr(self.hl, "cancel_and_place_orders") and not self.dry_run:
+            return self._update_atomic(decisions, snapshot)
+
         # 1. Cancel any lingering open orders (safety net for IOC leftovers)
         self.cancel_all()
 
@@ -106,6 +110,86 @@ class OrderManager:
             if fill is not None:
                 fills.append(fill)
                 self._total_filled += 1
+
+        return fills
+
+    def _update_atomic(
+        self,
+        decisions: List[StrategyDecision],
+        snapshot: MarketSnapshot,
+    ) -> List[HLFill]:
+        """Atomic cancel-and-place path for proxies that support batching."""
+        fills: List[HLFill] = []
+
+        # 1. Process TWAP slices first (IOC, intentionally not batched)
+        twap_slices = self._twap.on_tick(snapshot)
+        for s in twap_slices:
+            fill = self._execute_child_slice(s)
+            if fill is not None:
+                fills.append(fill)
+                self._twap.record_fill(
+                    s.parent_order_id, fill.size, fill.price,
+                    snapshot.timestamp_ms,
+                )
+
+        # 2. Collect cancel OIDs from currently open orders
+        open_orders = self.hl.get_open_orders(self.instrument)
+        cancel_oids = [o.get("oid", "") for o in open_orders if o.get("oid")]
+
+        # 3. Collect new orders from strategy decisions
+        new_orders = []
+        for d in decisions:
+            if d.action != "place_order" or d.size <= 0 or d.limit_price <= 0:
+                continue
+
+            # Route TWAP parent orders through the regular TWAP executor path
+            if d.meta.get("execution_algo") == "twap":
+                parent = ParentOrder(
+                    instrument=d.instrument or self.instrument,
+                    side=d.side,
+                    target_qty=d.size,
+                    algo="twap",
+                    duration_ticks=d.meta.get("twap_duration_ticks", 5),
+                    urgency=d.meta.get("twap_urgency", 0.7),
+                    created_at_ms=snapshot.timestamp_ms,
+                )
+                self._twap.submit(parent)
+                log.info("TWAP submitted: %s %s %.6f over %d ticks",
+                         d.side.upper(), parent.instrument,
+                         parent.target_qty, parent.duration_ticks)
+                self._total_placed += 1
+                continue
+
+            new_orders.append({
+                "side": d.side,
+                "size": d.size,
+                "price": d.limit_price,
+                "tif": d.order_type,
+                "instrument": d.instrument or self.instrument,
+            })
+
+        # 4. Nothing to do after TWAP processing
+        if not cancel_oids and not new_orders:
+            return fills
+
+        # 5. Atomic cancel-and-place
+        batch_fills = self.hl.cancel_and_place_orders(
+            instrument=self.instrument,
+            cancel_oids=cancel_oids,
+            new_orders=new_orders,
+        )
+
+        self._total_placed += len(new_orders)
+        for f in batch_fills:
+            if f is not None:
+                fills.append(f)
+                self._total_filled += 1
+
+        if cancel_oids:
+            log.info("Atomic: cancelled %d + placed %d orders in 1 tx",
+                     len(cancel_oids), len(new_orders))
+        elif new_orders:
+            log.info("Atomic: placed %d orders in 1 tx", len(new_orders))
 
         return fills
 

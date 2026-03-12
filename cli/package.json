@@ -1,0 +1,13 @@
+{
+  "name": "af-node-signer",
+  "version": "1.0.0",
+  "description": "Node.js Sui transaction signer for Aftermath proxy",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "install-deps": "npm install"
+  },
+  "dependencies": {
+    "@mysten/sui": "^1.0.0"
+  }
+}

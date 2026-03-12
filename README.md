@@ -77,6 +77,98 @@ hl apex run --mainnet
 
 ---
 
+## Aftermath Finance (Sui)
+
+All 14 strategies can run on [Aftermath Finance](https://aftermath.finance) perpetuals on Sui instead of Hyperliquid. The `AftermathProxy` is a drop-in replacement for the Hyperliquid proxy — strategy code is unchanged.
+
+### Setup
+
+```bash
+# 1. Install the Node.js signing helper (one-time)
+cd cli && npm install && cd ..
+
+# 2. Install Python deps
+pip install -r requirements-af.txt    # optional: PyNaCl, bech32
+
+# 3. Set env vars
+export SUI_PRIVATE_KEY=suiprivkey1...    # or base64 Ed25519 key
+export AF_BASE_URL=https://aftermath.finance
+```
+
+### Usage
+
+```bash
+# Mock mode (no real transactions)
+hl af avellaneda_mm -i ETH-AF-PERP --mock --max-ticks 3
+
+# Live mode
+hl af engine_mm -i BTC-AF-PERP --tick 10
+
+# Any strategy works — same interface as HL
+hl af grid_mm -i SUI-AF-PERP --tick 15
+hl af simple_mm -i XAG-AF-PERP --tick 10
+```
+
+### Instrument naming
+
+| AF-style (preferred) | Also accepted |
+|---|---|
+| `ETH-AF-PERP` | `ETH-PERP`, `ETH`, `ETH/USD:USD` |
+| `BTC-AF-PERP` | `BTC-PERP`, `BTC` |
+| `XAG-AF-PERP` | `XAG-PERP`, `XAG` |
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `SUI_PRIVATE_KEY` | required | Bech32 (`suiprivkey1...`) or base64 Ed25519 key |
+| `AF_BASE_URL` | `https://aftermath.finance` | API base URL |
+| `AF_LEVERAGE` | `5` | Default leverage for new positions |
+| `AF_ACCOUNT_NUMBER` | auto-discovered | Override numeric account ID |
+| `AF_SUI_RPC` | auto (mainnet/testnet) | Sui fullnode RPC URL |
+| `AFTERMATH_WRITE_SETTLE_MS` | `2000` | Delay after each write to prevent stale object races |
+
+### Architecture
+
+The proxy translates the Nunchi engine's calls into Aftermath's native perpetuals API:
+
+```
+TradingEngine / OrderManager / Guard / Radar / Pulse
+        |
+        v
+  AftermathProxy (cli/af_proxy.py)     <-- drop-in for DirectHLProxy
+        |
+        v
+  Aftermath Native API (/api/perpetuals/*)
+        |
+        v
+  Node.js Sui Signer (cli/_af_node_signer.mjs)
+        |
+        v
+  Sui blockchain (signAndExecuteTransaction)
+```
+
+The signing pipeline uses `Transaction.fromKind()` from `@mysten/sui` — the same pattern as the Aftermath TypeScript SDK. All writes are serialized to prevent stale Sui object races.
+
+### Optimizations
+
+The proxy uses Aftermath's most efficient patterns:
+
+- **Atomic cancel-and-place**: The `OrderManager` detects the AF proxy and batches all order cancellations + new placements into a single `cancel-and-place-orders` Sui transaction. This saves 3-6x gas compared to individual cancel + place calls.
+- **Auto collateral allocation**: Before the first PostOnly order on a market, the proxy automatically calls `allocate-collateral` to pre-fund the position. No manual collateral management needed.
+- **Correct funding rate**: Uses `premiumTwap / indexPrice` from `/api/perpetuals/all-markets` instead of the inflated `estimatedFundingRate` field (see [Gotcha #18](https://aftermath.finance/docs)).
+- **Position cache**: `hasPosition` is cached for 10s per market to avoid redundant API calls during multi-order ticks. Cache invalidates after every write.
+- **Retry with backoff**: All HTTP calls retry 3x with exponential backoff on 429/5xx/timeout.
+
+### Known limitations
+
+- **Trigger orders**: `place_trigger_order` returns a tx digest, not the stop-order object ID. Cancellation requires the object ID from `stop-order-datas` (signed auth).
+- **No WebSocket orderbook**: Uses REST polling per tick. A WS subscription would reduce latency.
+- **APEX multi-slot**: Not yet integration-tested with Aftermath (should work via the same proxy interface).
+- **Not tested on mainnet with real funds**. Mock mode verified; live mode is API-correct but not battle-tested.
+
+---
+
 ## Strategies
 
 14 built-in strategies across four categories. Every strategy extends `BaseStrategy` with a single `on_tick()` method — no shared state, no hidden coupling between strategies.

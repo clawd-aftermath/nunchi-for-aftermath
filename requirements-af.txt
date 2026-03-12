@@ -1,0 +1,17 @@
+# Aftermath Finance proxy dependencies
+# Install on top of the base requirements.txt:
+#   pip install -r requirements-af.txt
+
+# HTTP client (requests is already in requirements.txt, listed here for clarity)
+requests>=2.31.0
+
+# Optional: faster Python Sui signing (avoids Node.js subprocess round-trip)
+# Install if available; the proxy falls back to Node.js if absent.
+# PyNaCl for Ed25519 signing
+PyNaCl>=1.5.0
+
+# Optional: bech32 decoding for suiprivkey1... keys
+bech32>=1.2.0
+
+# Optional: full pysui SDK (heavier, not required if using Node.js path)
+# pysui>=0.55.0

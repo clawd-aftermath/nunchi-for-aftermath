@@ -27,5 +27,8 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Node.js (Sui signer dependencies)
+node_modules/
+
 # Test / build artifacts
 .pytest_cache/
