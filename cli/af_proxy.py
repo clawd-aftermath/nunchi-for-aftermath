@@ -60,6 +60,12 @@ AF_LEVERAGE_DEFAULT = 5
 WRITE_SETTLE_MS_DEFAULT = 2_000
 AUTO_COLLATERAL_ALLOCATE_AMOUNT_DEFAULT = 100.0
 
+# Gas pool / sponsorship defaults
+# Set AF_SPONSOR_ADDRESS to enable gasless trading via GasPool.
+# When set, all trading transactions include a `sponsor` field so the
+# agent wallet never needs SUI for gas.
+AF_SPONSOR_ADDRESS_DEFAULT = ""  # empty = no sponsorship
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -430,21 +436,43 @@ def _wallet_address_via_node(private_key: str) -> str:
     return data["address"]
 
 
+def _sponsor_address() -> str:
+    """Return the gas pool sponsor wallet address, or empty string if not set."""
+    return os.environ.get("AF_SPONSOR_ADDRESS", AF_SPONSOR_ADDRESS_DEFAULT).strip()
+
+
+def _add_sponsor_to_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    """If a sponsor address is configured, add the ``sponsor`` field to a
+    transaction request body so the API returns a sponsored ``txKind`` +
+    ``sponsorSignature``.  This enables gasless trading via GasPool — the
+    agent wallet never needs SUI for gas.
+    """
+    sponsor = _sponsor_address()
+    if sponsor:
+        body["sponsor"] = {"walletAddress": sponsor}
+    return body
+
+
 def _sign_and_submit(
     private_key: str,
     tx_kind_b64: str,
     base_url: str,
     rpc_url: str,
+    sponsor_signature: Optional[str] = None,
 ) -> str:
     """Sign and submit a Sui TransactionKind. Returns digest.
 
     Tries Node.js helper first (most reliable), then pysui, then nacl fallback.
+
+    If *sponsor_signature* is provided (from a GasPool-sponsored response),
+    it is passed to the Node.js signer so both the agent's signature and the
+    sponsor's signature are submitted together.
     """
     tx_kind_bytes = base64.b64decode(tx_kind_b64)
 
     # 1. Try Node.js helper (always works if node + @mysten/sui installed)
     try:
-        return _node_sign_submit(private_key, tx_kind_b64, rpc_url)
+        return _node_sign_submit(private_key, tx_kind_b64, rpc_url, sponsor_signature=sponsor_signature)
     except FileNotFoundError:
         log.debug("Node signer script not found, trying pysui/nacl fallback")
     except Exception as e:
@@ -496,15 +524,28 @@ def _pysui_sign_submit(private_key: str, tx_kind_bytes: bytes, rpc_url: str) -> 
     raise RuntimeError(f"pysui submission failed: {result}")
 
 
-def _node_sign_submit(private_key: str, tx_kind_b64: str, rpc_url: str) -> str:
-    """Sign and submit via Node.js helper using stdin (no tmpfile)."""
+def _node_sign_submit(
+    private_key: str,
+    tx_kind_b64: str,
+    rpc_url: str,
+    sponsor_signature: Optional[str] = None,
+) -> str:
+    """Sign and submit via Node.js helper using stdin (no tmpfile).
+
+    When *sponsor_signature* is provided (from a GasPool-sponsored response),
+    it is included in the payload so the Node.js helper can submit the
+    transaction with both the agent's signature and the sponsor's signature.
+    """
     import subprocess
     script = _get_node_signer_script()
-    payload = json.dumps({
+    payload_dict: Dict[str, Any] = {
         "txKind": tx_kind_b64,
         "privateKey": private_key,
         "rpcUrl": rpc_url,
-    })
+    }
+    if sponsor_signature:
+        payload_dict["sponsorSignature"] = sponsor_signature
+    payload = json.dumps(payload_dict)
     result = subprocess.run(
         ["node", script, "--stdin"],
         input=payload,
@@ -780,6 +821,7 @@ def _place_order_native(
     }
     if leverage is not None:
         body["leverage"] = float(leverage)
+    _add_sponsor_to_body(body)
 
     resp = _request_with_retry(
         "POST",
@@ -797,7 +839,10 @@ def _place_order_native(
     if not tx_kind_b64:
         raise RuntimeError("AF place-limit-order returned no txKind")
 
-    digest = _sign_and_submit(private_key, tx_kind_b64, base_url, rpc_url)
+    digest = _sign_and_submit(
+        private_key, tx_kind_b64, base_url, rpc_url,
+        sponsor_signature=data.get("sponsorSignature"),
+    )
     return digest
 
 
@@ -822,7 +867,7 @@ def _cancel_orders_native(
     # Convert string IDs to BigInt-strings
     native_ids = [f"{oid.rstrip('n')}n" for oid in order_ids if oid.isdigit() or oid.rstrip("n").isdigit()]
 
-    body = {
+    body: Dict[str, Any] = {
         "accountId": f"{account_number}n",
         "walletAddress": wallet_address,
         "marketId": ch_id,
@@ -832,6 +877,7 @@ def _cancel_orders_native(
         "reduceOnly": False,
         "hasPosition": has_pos,
     }
+    _add_sponsor_to_body(body)
 
     resp = _request_with_retry(
         "POST",
@@ -849,7 +895,10 @@ def _cancel_orders_native(
     if not tx_kind_b64:
         return None
 
-    return _sign_and_submit(private_key, tx_kind_b64, base_url, rpc_url)
+    return _sign_and_submit(
+        private_key, tx_kind_b64, base_url, rpc_url,
+        sponsor_signature=data.get("sponsorSignature"),
+    )
 
 
 def _get_open_orders(base_url: str, account_number: int, instrument: str) -> List[Dict]:
@@ -1101,10 +1150,13 @@ class AftermathProxy:
         self._leverage: int = int(os.environ.get("AF_LEVERAGE", AF_LEVERAGE_DEFAULT))
         self._collateral_allocated: set = set()
 
+        self._sponsor = _sponsor_address()
+
         log.info(
-            "AftermathProxy initialised: wallet=%s... base=%s",
+            "AftermathProxy initialised: wallet=%s... base=%s sponsor=%s",
             self._wallet_address[:10],
             self._base_url,
+            self._sponsor[:10] + "..." if self._sponsor else "none (agent pays gas)",
         )
 
     # -- Internal helpers --
@@ -1333,6 +1385,7 @@ class AftermathProxy:
                     "hasPosition": has_pos,
                     "leverage": float(self._leverage),
                 }
+                _add_sponsor_to_body(body)
 
                 resp = _request_with_retry(
                     "POST",
@@ -1348,7 +1401,8 @@ class AftermathProxy:
                 if not tx_kind_b64:
                     return [None for _ in new_orders]
                 digest = _sign_and_submit(
-                    self._private_key, tx_kind_b64, self._base_url, self._rpc_url
+                    self._private_key, tx_kind_b64, self._base_url, self._rpc_url,
+                    sponsor_signature=data.get("sponsorSignature"),
                 )
                 _invalidate_position_cache()
                 time.sleep(_settle_ms() / 1000.0)

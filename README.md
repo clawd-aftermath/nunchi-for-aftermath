@@ -126,6 +126,7 @@ hl af simple_mm -i XAG-AF-PERP --tick 10
 | `AF_LEVERAGE` | `5` | Default leverage for new positions |
 | `AF_ACCOUNT_NUMBER` | auto-discovered | Override numeric account ID |
 | `AF_SUI_RPC` | auto (mainnet/testnet) | Sui fullnode RPC URL |
+| `AF_SPONSOR_ADDRESS` | disabled | Primary wallet address for GasPool sponsorship. When set, agent wallet never needs SUI for gas. |
 | `AFTERMATH_WRITE_SETTLE_MS` | `2000` | Delay after each write to prevent stale object races |
 
 ### Architecture
@@ -154,11 +155,40 @@ The signing pipeline uses `Transaction.fromKind()` from `@mysten/sui` — the sa
 
 The proxy uses Aftermath's most efficient patterns:
 
-- **Atomic cancel-and-place**: The `OrderManager` detects the AF proxy and batches all order cancellations + new placements into a single `cancel-and-place-orders` Sui transaction. This saves 3-6x gas compared to individual cancel + place calls.
+- **Atomic cancel-and-place**: The `OrderManager` detects the AF proxy and batches all order cancellations + new placements into a single `cancel-and-place-orders` Sui transaction. This saves ~7x gas compared to individual cancel + place calls.
+- **Gasless trading (GasPool)**: Set `AF_SPONSOR_ADDRESS` to a primary wallet that owns a GasPool. The agent wallet never needs SUI — gas is drawn from the pool automatically. Supports depositing USDC into the gas pool (auto-swaps to SUI via Aftermath router).
 - **Auto collateral allocation**: Before the first PostOnly order on a market, the proxy automatically calls `allocate-collateral` to pre-fund the position. No manual collateral management needed.
-- **Correct funding rate**: Uses `premiumTwap / indexPrice` from `/api/perpetuals/all-markets` instead of the inflated `estimatedFundingRate` field (see [Gotcha #18](https://aftermath.finance/docs)).
+- **Correct funding rate**: Uses `premiumTwap / indexPrice` from `/api/perpetuals/all-markets` instead of the inflated `estimatedFundingRate` field.
 - **Position cache**: `hasPosition` is cached for 10s per market to avoid redundant API calls during multi-order ticks. Cache invalidates after every write.
 - **Retry with backoff**: All HTTP calls retry 3x with exponential backoff on 429/5xx/timeout.
+
+### Gasless Trading Setup
+
+To run your bot without holding SUI in the agent wallet:
+
+1. From your primary wallet, create a GasPool: `POST /api/gas-pool/transactions/create`
+2. Deposit SUI or USDC into the pool: `POST /api/gas-pool/transactions/deposit` (USDC auto-swaps to SUI)
+3. Grant your agent wallet access: `POST /api/gas-pool/transactions/grant`
+4. Set `AF_SPONSOR_ADDRESS` to your primary wallet address
+5. Run your strategy — all transactions are now gas-sponsored
+
+See [docs/aftermath/gasless-trading.md](docs/aftermath/gasless-trading.md) for full details.
+
+### Aftermath Perpetuals Documentation
+
+Comprehensive integration docs are included in the repo:
+
+| Document | Description |
+|----------|-------------|
+| [Gasless Trading](docs/aftermath/gasless-trading.md) | GasPool setup, USDC-as-gas, sponsored transactions |
+| [Market Maker Economics](docs/aftermath/market-maker-economics.md) | Fee tiers, gas costs, PTBs, RGP protection |
+| [Market Makers Guide](docs/aftermath/market-makers.md) | Integration guide, gas optimization tips, example requests |
+| [Agent Wallets](docs/aftermath/agent-wallets.md) | Delegate trading without transferring ownership |
+| [Sub-Accounts](docs/aftermath/sub-accounts.md) | Strategy isolation with shared fee tiers |
+
+### Aftermath Perpetuals Skill
+
+A comprehensive agent skill for Aftermath integration is included at [`skills/aftermath-perpetuals/`](skills/aftermath-perpetuals/SKILL.md). It covers native endpoints, CCXT compatibility, TypeScript SDK, error handling, safety/risk patterns, market making optimization, and gotchas.
 
 ### Known limitations
 
