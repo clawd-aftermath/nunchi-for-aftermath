@@ -21,13 +21,16 @@ Required env vars:
   SUI_PRIVATE_KEY   - Bech32 (suiprivkey1...) or Base64 Ed25519 key
   AF_BASE_URL       - Aftermath API base (default: https://v2-preview.aftermath.finance)
   AF_COLLATERAL_TYPE - USDC coin type (default: 0xdba3...::usdc::USDC)
-  AF_COLLATERAL_DECIMALS - Collateral token decimals (default: 6 for USDC)
+  AF_COLLATERAL_DECIMALS - Required for collateral types other than known USDC
   AF_SUI_RPC        - Sui fullnode RPC URL (default: auto from AF_BASE_URL)
 
 Optional:
   AF_ACCOUNT_NUMBER - Override numeric account ID (auto-discovered if unset)
   AF_LEVERAGE       - Default leverage for new positions (default: 5)
   AFTERMATH_WRITE_SETTLE_MS - ms to wait after each Sui write (default: 2000)
+  AF_SPONSORED_MAX_GAS_BUDGET - Sponsored gas-budget ceiling in MIST
+  AF_SPONSORED_MAX_GAS_PRICE - Sponsored gas-price ceiling in MIST per gas unit
+  AF_ALLOWED_PACKAGES - Comma-separated sponsored Move package allowlist
 """
 from __future__ import annotations
 
@@ -42,7 +45,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from common.models import MarketSnapshot
+from common.models import DEFAULT_FUNDING_INTERVAL_HOURS, MarketSnapshot
 from parent.hl_proxy import HLFill
 
 log = logging.getLogger("af_proxy")
@@ -61,6 +64,8 @@ AF_LEVERAGE_DEFAULT = 5
 WRITE_SETTLE_MS_DEFAULT = 2_000
 AUTO_COLLATERAL_ALLOCATE_AMOUNT_DEFAULT = 100.0
 AF_COLLATERAL_DECIMALS_DEFAULT = 6
+AF_SPONSORED_MAX_GAS_BUDGET_DEFAULT = 100_000_000
+AF_SPONSORED_MAX_GAS_PRICE_DEFAULT = 10_000
 
 # Gas pool / sponsorship defaults
 # Set AF_SPONSOR_ADDRESS to enable gasless trading via GasPool.
@@ -93,18 +98,34 @@ def _to_native_int(value: float) -> str:
     return f"{int(round(value * 1e9))}n"
 
 
+def _collateral_decimals() -> int:
+    """Return collateral decimals, failing closed for unknown coin types."""
+    raw_decimals = os.environ.get("AF_COLLATERAL_DECIMALS")
+    collateral_type = os.environ.get(
+        "AF_COLLATERAL_TYPE",
+        AF_COLLATERAL_TYPE_DEFAULT,
+    ).strip()
+
+    if raw_decimals is None:
+        if collateral_type == AF_COLLATERAL_TYPE_DEFAULT:
+            return AF_COLLATERAL_DECIMALS_DEFAULT
+        raise ValueError(
+            "AF_COLLATERAL_DECIMALS is required when AF_COLLATERAL_TYPE "
+            "is not the known USDC type"
+        )
+
+    try:
+        decimals = int(raw_decimals)
+    except ValueError:
+        raise ValueError("AF_COLLATERAL_DECIMALS must be an integer") from None
+    if not 0 <= decimals <= 18:
+        raise ValueError("AF_COLLATERAL_DECIMALS must be between 0 and 18")
+    return decimals
+
+
 def _to_collateral_int(value: float) -> str:
     """Convert a human collateral amount to native token units."""
-    raw_decimals = os.environ.get("AF_COLLATERAL_DECIMALS")
-    try:
-        decimals = (
-            int(raw_decimals)
-            if raw_decimals is not None
-            else AF_COLLATERAL_DECIMALS_DEFAULT
-        )
-    except ValueError:
-        decimals = AF_COLLATERAL_DECIMALS_DEFAULT
-    decimals = min(max(decimals, 0), 18)
+    decimals = _collateral_decimals()
     decimal_value = Decimal(str(value))
     native_amount = int(decimal_value.scaleb(decimals))
     if decimal_value < 0:
@@ -114,6 +135,115 @@ def _to_collateral_int(value: float) -> str:
             f"Collateral allocation amount is below {decimals}-decimal precision"
         )
     return f"{native_amount}n"
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return value
+
+
+def _sponsored_max_gas_budget() -> int:
+    return _positive_int_env(
+        "AF_SPONSORED_MAX_GAS_BUDGET",
+        AF_SPONSORED_MAX_GAS_BUDGET_DEFAULT,
+    )
+
+
+def _sponsored_max_gas_price() -> int:
+    return _positive_int_env(
+        "AF_SPONSORED_MAX_GAS_PRICE",
+        AF_SPONSORED_MAX_GAS_PRICE_DEFAULT,
+    )
+
+
+def _allowed_sponsored_packages() -> List[str]:
+    raw_packages = os.environ.get("AF_ALLOWED_PACKAGES", "")
+    packages = [
+        package_id.strip().lower()
+        for package_id in raw_packages.split(",")
+        if package_id.strip()
+    ]
+    if not packages:
+        raise ValueError(
+            "AF_ALLOWED_PACKAGES is required for sponsored transactions"
+        )
+    for package_id in packages:
+        if len(package_id) != 66 or not package_id.startswith("0x"):
+            raise ValueError(
+                "AF_ALLOWED_PACKAGES entries must be full 0x-prefixed "
+                "32-byte package IDs"
+            )
+        try:
+            int(package_id[2:], 16)
+        except ValueError:
+            raise ValueError(
+                f"AF_ALLOWED_PACKAGES contains invalid package ID {package_id}"
+            ) from None
+    return packages
+
+
+def _funding_interval_hours(market_state: Dict[str, Any]) -> float:
+    """Return the period represented by ``estimatedFundingRate``."""
+    market_params = market_state.get("marketParams")
+    if not isinstance(market_params, dict):
+        log.warning(
+            "Missing marketParams.fundingFrequencyMs; assuming %.1fh",
+            DEFAULT_FUNDING_INTERVAL_HOURS,
+        )
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+    raw_frequency = market_params.get("fundingFrequencyMs")
+    try:
+        frequency_ms = int(str(raw_frequency).rstrip("n"))
+    except (TypeError, ValueError):
+        log.warning(
+            "Invalid fundingFrequencyMs=%r; assuming %.1fh",
+            raw_frequency,
+            DEFAULT_FUNDING_INTERVAL_HOURS,
+        )
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+    if frequency_ms <= 0:
+        log.warning(
+            "Nonpositive fundingFrequencyMs=%r; assuming %.1fh",
+            raw_frequency,
+            DEFAULT_FUNDING_INTERVAL_HOURS,
+        )
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+    return frequency_ms / 3_600_000
+
+
+def _assert_market_collateral_type(
+    base_url: str,
+    market_id: str,
+    market: Dict[str, Any],
+) -> None:
+    """Bind allocation precision to the market's configured collateral coin."""
+    configured_type = os.environ.get(
+        "AF_COLLATERAL_TYPE",
+        AF_COLLATERAL_TYPE_DEFAULT,
+    ).strip()
+    market_state = _all_markets(base_url).get(market_id, {})
+    market_type = market_state.get("collateralCoinType")
+    if not market_type:
+        raw_market = market.get("raw")
+        if isinstance(raw_market, dict):
+            market_type = raw_market.get("settleId")
+    if not market_type:
+        raise RuntimeError(
+            f"Cannot verify collateral coin type for market {market_id}"
+        )
+    if market_type != configured_type:
+        raise RuntimeError(
+            "Configured AF_COLLATERAL_TYPE does not match market collateral: "
+            f"configured={configured_type}, market={market_type}"
+        )
 
 
 def _order_type_from_tif(tif: str) -> int:
@@ -585,7 +715,15 @@ def _node_sign_submit(
         "rpcUrl": rpc_url,
     }
     if sponsor_signature:
+        if not _sponsor_address():
+            raise ValueError(
+                "Received a sponsored transaction without an explicitly "
+                "configured AF_SPONSOR_ADDRESS"
+            )
         payload_dict["sponsorSignature"] = sponsor_signature
+        payload_dict["maxGasBudget"] = str(_sponsored_max_gas_budget())
+        payload_dict["maxGasPrice"] = str(_sponsored_max_gas_price())
+        payload_dict["allowedPackages"] = _allowed_sponsored_packages()
     payload = json.dumps(payload_dict)
     result = subprocess.run(
         ["node", script, "--stdin"],
@@ -737,6 +875,7 @@ def _fetch_snapshot(base_url: str, instrument: str) -> MarketSnapshot:
     except Exception:
         pass
 
+    market_state: Dict[str, Any] = {}
     try:
         market_state = _all_markets(base_url).get(ch_id, {})
         # V2 estimates the rate for fundingFrequencyMs. For current markets,
@@ -755,6 +894,7 @@ def _fetch_snapshot(base_url: str, instrument: str) -> MarketSnapshot:
         timestamp_ms=int(time.time() * 1000),
         volume_24h=volume_24h,
         funding_rate=funding_rate,
+        funding_interval_hours=_funding_interval_hours(market_state),
         open_interest=open_interest,
     )
 
@@ -952,7 +1092,10 @@ def _cancel_orders_native(
         "orderType": 2,  # PostOnly
         "reduceOnly": False,
         "hasPosition": has_pos,
-        "shouldAbortOnMissingId": False,
+        # Standalone cancellation should surface a stale/unknown order ID.
+        # Atomic cancel-replace deliberately uses false so a filled stale order
+        # does not block placement of the refreshed quote.
+        "shouldAbortOnMissingId": True,
         "shouldDeallocateFreeCollateral": False,
     }
     _add_sponsor_to_body(body)
@@ -1135,12 +1278,14 @@ def _get_all_markets_hl_format(base_url: str) -> Any:
         s = stats_by_id.get(ch_id, {})
         market_state = all_markets_state.get(ch_id, {})
         funding = float(market_state.get("estimatedFundingRate", 0) or 0)
+        funding_interval_hours = _funding_interval_hours(market_state)
         mark_px = market_state.get("markPrice") or s.get("markPrice", "0") or "0"
         prev_day_px = market_state.get("indexPrice24hrsAgo") or s.get("prevDayPx")
         if prev_day_px is None and s.get("basePrice") is not None:
             prev_day_px = float(s["basePrice"]) - float(s.get("priceChange", 0) or 0)
         asset_ctxs.append({
             "funding": str(funding),
+            "fundingIntervalHours": funding_interval_hours,
             "openInterest": str(market_state.get("openInterest", s.get("openInterest", "0")) or "0"),
             "prevDayPx": str(prev_day_px or "0"),
             "dayNtlVlm": str(s.get("volumeUsd", s.get("volume24h", "0")) or "0"),
@@ -1339,6 +1484,7 @@ class AftermathProxy:
         try:
             mkt = _get_market(self._base_url, instrument)
             ch_id = mkt["chId"]
+            _assert_market_collateral_type(self._base_url, ch_id, mkt)
             acc_num = self._account_number()
             body = {
                 "accountId": f"{acc_num}n",
@@ -1749,6 +1895,7 @@ class AftermathMockProxy:
             timestamp_ms=int(time.time() * 1000),
             volume_24h=1_000_000.0,
             funding_rate=0.0001,
+            funding_interval_hours=1.0,
             open_interest=500_000.0,
         )
 

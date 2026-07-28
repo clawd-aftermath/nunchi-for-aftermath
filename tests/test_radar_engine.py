@@ -1,6 +1,4 @@
 """Tests for modules/radar_engine.py — full pipeline with synthetic data."""
-import pytest
-
 from modules.radar_config import RadarConfig
 from modules.radar_engine import AssetMeta, OpportunityRadarEngine
 from modules.radar_state import Opportunity, RadarResult
@@ -59,6 +57,7 @@ def _make_markets(assets_data):
         {
             "dayNtlVlm": str(a[1]),
             "funding": str(a[2]),
+            "fundingIntervalHours": str(a[5] if len(a) > 5 else 1.0),
             "openInterest": str(a[3]),
             "markPx": str(a[4]),
             "prevDayPx": str(a[4] * 0.99),
@@ -122,6 +121,13 @@ class TestBulkScreen:
         assert self.engine._bulk_screen([]) == []
         assert self.engine._bulk_screen([{}, []]) == []
 
+    def test_preserves_funding_interval_from_market_context(self):
+        assets = self.engine._bulk_screen(
+            _make_markets([("ETH", 1_000_000, 0.0001, 5e7, 2500, 8.0)])
+        )
+
+        assert assets[0].funding_interval_hours == 8.0
+
 
 # ── Select Top ───────────────────────────────────────────────────────
 
@@ -150,6 +156,47 @@ class TestDeepDive:
             "trend": "neutral",
             "modifiers": {"LONG": 0, "SHORT": 0},
         }
+
+    def test_hourly_funding_interval_affects_unfavorable_funding_decision(self):
+        hourly_asset = AssetMeta(
+            "TEST",
+            5e6,
+            0.0001,
+            5e6,
+            100,
+            funding_interval_hours=1.0,
+        )
+        eight_hour_asset = AssetMeta(
+            "TEST",
+            5e6,
+            0.0001,
+            5e6,
+            100,
+            funding_interval_hours=8.0,
+        )
+        candles = _make_candles(
+            [100 + (1 if i % 2 == 0 else -1) for i in range(50)]
+        )
+
+        hourly_result = self.engine._deep_dive(
+            hourly_asset,
+            candles,
+            candles,
+            candles,
+            self.btc_macro,
+            "LONG",
+        )
+        eight_hour_result = self.engine._deep_dive(
+            eight_hour_asset,
+            candles,
+            candles,
+            candles,
+            self.btc_macro,
+            "LONG",
+        )
+
+        assert hourly_result.reason == "heavy_unfavorable_funding"
+        assert isinstance(eight_hour_result, Opportunity)
 
     def test_counter_trend_hourly_disqualifies(self):
         # LONG with DOWN hourly trend → disqualified

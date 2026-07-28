@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import deque
 from typing import List, Optional
 
-from common.models import MarketSnapshot, StrategyDecision
+from common.models import MarketSnapshot, StrategyDecision, annualize_funding_rate
 from sdk.strategy_sdk.base import BaseStrategy, StrategyContext
 
 
@@ -35,10 +35,15 @@ class BasisArbStrategy(BaseStrategy):
         if len(self.funding_history) < 3:
             return []
 
-        # Annualized basis in bps: funding_rate * 365 * 24 * 100 (8h funding)
-        # But funding_rate is typically per-8h, so annualize
         avg_funding = sum(self.funding_history) / len(self.funding_history)
-        basis_ann_bps = avg_funding * 365 * 3 * 10_000  # 3x per day * 365 days
+        try:
+            annualized_funding = annualize_funding_rate(
+                avg_funding,
+                snapshot.funding_interval_hours,
+            )
+        except ValueError:
+            return []
+        basis_ann_bps = annualized_funding * 10_000
 
         ctx = context or StrategyContext()
         orders: List[StrategyDecision] = []

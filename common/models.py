@@ -6,6 +6,16 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+DEFAULT_FUNDING_INTERVAL_HOURS = 1.0
+
+
+def annualize_funding_rate(funding_rate: float, interval_hours: float) -> float:
+    """Annualize a periodic funding rate, preserving its sign."""
+    if interval_hours <= 0:
+        raise ValueError("Funding interval must be greater than zero")
+    return funding_rate * (24 / interval_hours) * 365
+
+
 class MarketSnapshot(BaseModel):
     instrument: str = "ETH-PERP"
     mid_price: float = 0.0
@@ -15,6 +25,7 @@ class MarketSnapshot(BaseModel):
     timestamp_ms: int = 0
     volume_24h: float = 0.0
     funding_rate: float = 0.0
+    funding_interval_hours: float = DEFAULT_FUNDING_INTERVAL_HOURS
     open_interest: float = 0.0
 
 

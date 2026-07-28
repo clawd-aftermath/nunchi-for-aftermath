@@ -2,22 +2,31 @@
 import os
 import sys
 
-import pytest
-
 _root = str(os.path.join(os.path.dirname(__file__), ".."))
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from common.models import MarketSnapshot, StrategyDecision
+from common.models import MarketSnapshot
 from sdk.strategy_sdk.base import StrategyContext
 
 
-def _snap(mid=2500.0, bid=2499.0, ask=2501.0, funding=0.0001, oi=1e6, ts=1000):
+def _snap(
+    mid=2500.0,
+    bid=2499.0,
+    ask=2501.0,
+    funding=0.0001,
+    funding_interval_hours=8.0,
+    oi=1e6,
+    ts=1000,
+):
     spread_bps = round((ask - bid) / mid * 10000, 2) if mid > 0 else 0.0
     return MarketSnapshot(
         instrument="ETH-PERP", mid_price=mid, bid=bid, ask=ask,
         spread_bps=spread_bps,
-        funding_rate=funding, open_interest=oi, timestamp_ms=ts,
+        funding_rate=funding,
+        funding_interval_hours=funding_interval_hours,
+        open_interest=oi,
+        timestamp_ms=ts,
     )
 
 
@@ -192,6 +201,62 @@ class TestBasisArb:
         for _ in range(3):
             orders = strat.on_tick(_snap(funding=0.00001), _ctx())
         assert orders == []
+
+    def test_interval_aware_annualization_preserves_equivalent_rates(self):
+        from strategies.basis_arb import BasisArbStrategy
+
+        hourly = BasisArbStrategy(
+            basis_threshold_bps=1.0,
+            funding_window=3,
+        )
+        eight_hour = BasisArbStrategy(
+            basis_threshold_bps=1.0,
+            funding_window=3,
+        )
+
+        for _ in range(3):
+            hourly_orders = hourly.on_tick(
+                _snap(funding=0.0001, funding_interval_hours=1.0),
+                _ctx(),
+            )
+            eight_hour_orders = eight_hour.on_tick(
+                _snap(funding=0.0008, funding_interval_hours=8.0),
+                _ctx(),
+            )
+
+        assert hourly_orders[0].meta["basis_ann_bps"] == 8760.0
+        assert (
+            hourly_orders[0].meta["basis_ann_bps"]
+            == eight_hour_orders[0].meta["basis_ann_bps"]
+        )
+
+    def test_interval_aware_annualization_preserves_negative_rate_sign(self):
+        from strategies.basis_arb import BasisArbStrategy
+
+        hourly = BasisArbStrategy(
+            basis_threshold_bps=1.0,
+            funding_window=3,
+        )
+        eight_hour = BasisArbStrategy(
+            basis_threshold_bps=1.0,
+            funding_window=3,
+        )
+
+        for _ in range(3):
+            hourly_orders = hourly.on_tick(
+                _snap(funding=-0.0001, funding_interval_hours=1.0),
+                _ctx(),
+            )
+            eight_hour_orders = eight_hour.on_tick(
+                _snap(funding=-0.0008, funding_interval_hours=8.0),
+                _ctx(),
+            )
+
+        assert hourly_orders[0].meta["basis_ann_bps"] == -8760.0
+        assert (
+            hourly_orders[0].meta["basis_ann_bps"]
+            == eight_hour_orders[0].meta["basis_ann_bps"]
+        )
 
     def test_closes_wrong_side(self):
         from strategies.basis_arb import BasisArbStrategy

@@ -10,6 +10,7 @@ import pytest
 from cli import af_proxy
 
 MARKET_ID = "0x" + "1" * 64
+PACKAGE_ID = "0x" + "4" * 64
 
 
 class _Response:
@@ -154,6 +155,7 @@ def test_fetch_snapshot_parses_v2_orderbook_and_stats_wrappers():
                 MARKET_ID: {
                     "estimatedFundingRate": 0.0001,
                     "openInterest": 42.0,
+                    "marketParams": {"fundingFrequencyMs": "3600000n"},
                 }
             },
         ),
@@ -166,6 +168,7 @@ def test_fetch_snapshot_parses_v2_orderbook_and_stats_wrappers():
     assert snapshot.volume_24h == 1234.5
     assert snapshot.open_interest == 42.0
     assert snapshot.funding_rate == 0.0001
+    assert snapshot.funding_interval_hours == 1.0
 
 
 def test_fetch_snapshot_rejects_crossed_v2_orderbook():
@@ -338,6 +341,15 @@ def test_allocate_collateral_uses_native_units_and_forwards_sponsor_signature():
             "_get_market",
             return_value={"chId": MARKET_ID, "base": "BTC"},
         ),
+        patch.object(
+            af_proxy,
+            "_all_markets",
+            return_value={
+                MARKET_ID: {
+                    "collateralCoinType": af_proxy.AF_COLLATERAL_TYPE_DEFAULT,
+                }
+            },
+        ),
         patch.object(af_proxy, "_sponsor_address", return_value="0xsponsor"),
         patch.object(
             af_proxy,
@@ -369,6 +381,60 @@ def test_collateral_allocation_rejects_subnative_positive_amount(monkeypatch):
 
     with pytest.raises(ValueError, match="below 6-decimal precision"):
         af_proxy._to_collateral_int(0.0000001)
+
+
+def test_known_usdc_uses_six_decimals_when_unset(monkeypatch):
+    monkeypatch.delenv("AF_COLLATERAL_DECIMALS", raising=False)
+    monkeypatch.setenv(
+        "AF_COLLATERAL_TYPE",
+        af_proxy.AF_COLLATERAL_TYPE_DEFAULT,
+    )
+
+    assert af_proxy._to_collateral_int(1.25) == "1250000n"
+
+
+def test_unknown_collateral_requires_explicit_decimals(monkeypatch):
+    monkeypatch.delenv("AF_COLLATERAL_DECIMALS", raising=False)
+    monkeypatch.setenv("AF_COLLATERAL_TYPE", "0x2::custom::COIN")
+
+    with pytest.raises(ValueError, match="required.*not the known USDC"):
+        af_proxy._to_collateral_int(1.0)
+
+
+def test_unknown_collateral_accepts_valid_explicit_decimals(monkeypatch):
+    monkeypatch.setenv("AF_COLLATERAL_TYPE", "0x2::custom::COIN")
+    monkeypatch.setenv("AF_COLLATERAL_DECIMALS", "9")
+
+    assert af_proxy._to_collateral_int(1.25) == "1250000000n"
+
+
+def test_collateral_decimals_reject_invalid_range(monkeypatch):
+    monkeypatch.setenv("AF_COLLATERAL_DECIMALS", "19")
+
+    with pytest.raises(ValueError, match="between 0 and 18"):
+        af_proxy._to_collateral_int(1.0)
+
+
+def test_market_collateral_type_must_match_configured_type(monkeypatch):
+    monkeypatch.setenv("AF_COLLATERAL_TYPE", "0x2::custom::COIN")
+
+    with (
+        patch.object(
+            af_proxy,
+            "_all_markets",
+            return_value={
+                MARKET_ID: {
+                    "collateralCoinType": af_proxy.AF_COLLATERAL_TYPE_DEFAULT,
+                }
+            },
+        ),
+        pytest.raises(RuntimeError, match="does not match market collateral"),
+    ):
+        af_proxy._assert_market_collateral_type(
+            "https://example.test",
+            MARKET_ID,
+            {"raw": {"settleId": af_proxy.AF_COLLATERAL_TYPE_DEFAULT}},
+        )
 
 
 def test_cancel_and_place_orders_includes_v2_transaction_flags():
@@ -419,7 +485,43 @@ def test_cancel_and_place_orders_includes_v2_transaction_flags():
     assert fills[0].oid == "digest"
 
 
-def test_node_signer_payload_includes_sponsor_signature():
+def test_standalone_cancel_aborts_on_missing_order_id():
+    response = _Response({"txKind": "dHg="})
+
+    with (
+        patch.object(
+            af_proxy,
+            "_get_market",
+            return_value={"chId": MARKET_ID, "base": "BTC"},
+        ),
+        patch.object(af_proxy, "_has_position", return_value=False),
+        patch.object(af_proxy, "_sponsor_address", return_value=None),
+        patch.object(
+            af_proxy,
+            "_request_with_retry",
+            return_value=response,
+        ) as request,
+        patch.object(af_proxy, "_sign_and_submit", return_value="digest"),
+    ):
+        digest = af_proxy._cancel_orders_native(
+            "https://example.test",
+            "private",
+            "https://rpc.test",
+            "0xsender",
+            7,
+            "BTC-AF-PERP",
+            ["123"],
+        )
+
+    assert digest == "digest"
+    payload = request.call_args.kwargs["json"]
+    assert payload["shouldAbortOnMissingId"] is True
+    assert payload["shouldDeallocateFreeCollateral"] is False
+
+
+def test_node_signer_payload_includes_sponsor_signature(monkeypatch):
+    monkeypatch.setenv("AF_SPONSOR_ADDRESS", "0xsponsor")
+    monkeypatch.setenv("AF_ALLOWED_PACKAGES", PACKAGE_ID)
     completed = MagicMock(returncode=0, stdout='{"digest":"digest"}', stderr="")
 
     with (
@@ -440,6 +542,109 @@ def test_node_signer_payload_includes_sponsor_signature():
     assert digest == "digest"
     payload = json.loads(run.call_args.kwargs["input"])
     assert payload["sponsorSignature"] == "sponsor-signature"
+    assert payload["maxGasBudget"] == "100000000"
+    assert payload["maxGasPrice"] == "10000"
+    assert payload["allowedPackages"] == [PACKAGE_ID]
+
+
+def test_node_signer_payload_uses_configured_sponsored_gas_ceilings(monkeypatch):
+    monkeypatch.setenv("AF_SPONSOR_ADDRESS", "0xsponsor")
+    monkeypatch.setenv("AF_ALLOWED_PACKAGES", PACKAGE_ID)
+    monkeypatch.setenv("AF_SPONSORED_MAX_GAS_BUDGET", "50000000")
+    monkeypatch.setenv("AF_SPONSORED_MAX_GAS_PRICE", "5000")
+    completed = MagicMock(returncode=0, stdout='{"digest":"digest"}', stderr="")
+
+    with (
+        patch.object(
+            af_proxy,
+            "_get_node_signer_script",
+            return_value="/tmp/signer.mjs",
+        ),
+        patch("subprocess.run", return_value=completed) as run,
+    ):
+        af_proxy._node_sign_submit(
+            "private",
+            "dHg=",
+            "https://rpc.test",
+            sponsor_signature="sponsor-signature",
+        )
+
+    payload = json.loads(run.call_args.kwargs["input"])
+    assert payload["maxGasBudget"] == "50000000"
+    assert payload["maxGasPrice"] == "5000"
+
+
+def test_invalid_sponsored_gas_ceiling_fails_before_node(monkeypatch):
+    monkeypatch.setenv("AF_SPONSOR_ADDRESS", "0xsponsor")
+    monkeypatch.setenv("AF_ALLOWED_PACKAGES", PACKAGE_ID)
+    monkeypatch.setenv("AF_SPONSORED_MAX_GAS_BUDGET", "0")
+
+    with (
+        patch.object(
+            af_proxy,
+            "_get_node_signer_script",
+            return_value="/tmp/signer.mjs",
+        ),
+        patch("subprocess.run") as run,
+        pytest.raises(ValueError, match="must be greater than zero"),
+    ):
+        af_proxy._node_sign_submit(
+            "private",
+            "dHg=",
+            "https://rpc.test",
+            sponsor_signature="sponsor-signature",
+        )
+
+    run.assert_not_called()
+
+
+def test_missing_sponsored_package_allowlist_fails_before_node(monkeypatch):
+    monkeypatch.setenv("AF_SPONSOR_ADDRESS", "0xsponsor")
+    monkeypatch.delenv("AF_ALLOWED_PACKAGES", raising=False)
+
+    with (
+        patch.object(
+            af_proxy,
+            "_get_node_signer_script",
+            return_value="/tmp/signer.mjs",
+        ),
+        patch("subprocess.run") as run,
+        pytest.raises(ValueError, match="AF_ALLOWED_PACKAGES is required"),
+    ):
+        af_proxy._node_sign_submit(
+            "private",
+            "dHg=",
+            "https://rpc.test",
+            sponsor_signature="sponsor-signature",
+        )
+
+    run.assert_not_called()
+
+
+def test_unrequested_sponsored_transaction_fails_before_node(monkeypatch):
+    monkeypatch.delenv("AF_SPONSOR_ADDRESS", raising=False)
+    monkeypatch.setenv("AF_ALLOWED_PACKAGES", PACKAGE_ID)
+
+    with (
+        patch.object(
+            af_proxy,
+            "_get_node_signer_script",
+            return_value="/tmp/signer.mjs",
+        ),
+        patch("subprocess.run") as run,
+        pytest.raises(
+            ValueError,
+            match="without an explicitly configured AF_SPONSOR_ADDRESS",
+        ),
+    ):
+        af_proxy._node_sign_submit(
+            "private",
+            "dHg=",
+            "https://rpc.test",
+            sponsor_signature="sponsor-signature",
+        )
+
+    run.assert_not_called()
 
 
 def test_preview_error_header_is_not_treated_as_success():

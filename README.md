@@ -123,11 +123,15 @@ hl af simple_mm -i XAG-AF-PERP --tick 10
 |---|---|---|
 | `SUI_PRIVATE_KEY` | required | Bech32 (`suiprivkey1...`) or base64 Ed25519 key |
 | `AF_BASE_URL` | `https://v2-preview.aftermath.finance` | Post-relaunch API base URL |
-| `AF_COLLATERAL_DECIMALS` | `6` | Collateral token decimals used when allocating human-readable amounts |
+| `AF_COLLATERAL_TYPE` | known USDC type | Collateral coin type |
+| `AF_COLLATERAL_DECIMALS` | `6` only for known USDC | Required for any other collateral type; invalid or missing precision fails closed |
 | `AF_LEVERAGE` | `5` | Default leverage for new positions |
 | `AF_ACCOUNT_NUMBER` | auto-discovered | Override numeric account ID |
 | `AF_SUI_RPC` | auto (mainnet/testnet) | Sui fullnode RPC URL |
 | `AF_SPONSOR_ADDRESS` | disabled | Primary wallet address for GasPool sponsorship. When set, agent wallet never needs SUI for gas. |
+| `AF_ALLOWED_PACKAGES` | required with sponsorship | Comma-separated, full 32-byte Sui package IDs permitted in sponsored transaction Move calls |
+| `AF_SPONSORED_MAX_GAS_BUDGET` | `100000000` | Maximum sponsored transaction gas budget in MIST (0.1 SUI) |
+| `AF_SPONSORED_MAX_GAS_PRICE` | `10000` | Maximum sponsored gas price in MIST per gas unit |
 | `AFTERMATH_WRITE_SETTLE_MS` | `2000` | Delay after each write to prevent stale object races |
 
 ### Architecture
@@ -150,16 +154,16 @@ TradingEngine / OrderManager / Guard / Radar / Pulse
   Sui blockchain (signAndExecuteTransaction)
 ```
 
-The signing pipeline uses `Transaction.fromKind()` for unsponsored V2 transaction kinds. Sponsored responses contain fully resolved transaction data; the signer validates and signs those exact bytes so it does not invalidate the sponsor signature. All writes are serialized to prevent stale Sui object races.
+The signing pipeline uses `Transaction.fromKind()` for unsponsored V2 transaction kinds. Sponsored responses contain fully resolved transaction data; before signing the exact bytes, the signer requires the transaction sender to match the local key, requires a distinct gas owner, allowlists every Move-call package, rejects publish/upgrade/object-transfer and unknown command kinds, and enforces local gas-budget and gas-price ceilings. The sponsor's gas funds—not the agent wallet—pay the transaction. The ceilings are local anomaly-detection limits on remotely constructed transaction data, not spending limits on the agent wallet. All writes are serialized to prevent stale Sui object races.
 
 ### Optimizations
 
 The proxy uses Aftermath's most efficient patterns:
 
-- **Atomic cancel-and-place**: The `OrderManager` detects the AF proxy and batches all order cancellations + new placements into a single `cancel-and-place-orders` Sui transaction. This saves ~7x gas compared to individual cancel + place calls.
+- **Atomic cancel-and-place**: The `OrderManager` detects the AF proxy and batches all order cancellations + new placements into a single `cancel-and-place-orders` Sui transaction. Missing stale IDs are tolerated so a just-filled quote cannot abort its replacement. Standalone cancellation fails if its requested ID is missing. This saves ~7x gas compared to individual cancel + place calls.
 - **Gasless trading (GasPool)**: Set `AF_SPONSOR_ADDRESS` to a primary wallet that owns a GasPool. The agent wallet never needs SUI — gas is drawn from the pool automatically. Supports depositing USDC into the gas pool (auto-swaps to SUI via Aftermath router).
 - **Auto collateral allocation**: Before the first PostOnly order on a market, the proxy automatically calls `allocate-collateral` to pre-fund the position. No manual collateral management needed.
-- **Canonical funding rate**: Uses the periodic `estimatedFundingRate` from the V2 `/api/perpetuals/all-markets` response. For current markets, that is an hourly rate and replaces the full eight-hour premium previously exposed by the proxy. Cross-venue funding consumers now receive the expected hourly value.
+- **Canonical funding rate**: Uses the periodic `estimatedFundingRate` and `fundingFrequencyMs` from the V2 `/api/perpetuals/all-markets` response. BasisArb and Radar now annualize by each market's actual interval instead of assuming eight hours.
 - **Position cache**: `hasPosition` is cached for 10s per market to avoid redundant API calls during multi-order ticks. Cache invalidates after every write.
 - **Retry with backoff**: All HTTP calls retry 3x with exponential backoff on 429/5xx/timeout.
 
@@ -171,7 +175,9 @@ To run your bot without holding SUI in the agent wallet:
 2. Deposit SUI or USDC into the pool: `POST /api/gas-pool/transactions/deposit` (USDC auto-swaps to SUI)
 3. Grant your agent wallet access: `POST /api/gas-pool/transactions/grant`
 4. Set `AF_SPONSOR_ADDRESS` to your primary wallet address
-5. Run your strategy — all transactions are now gas-sponsored
+5. Set `AF_ALLOWED_PACKAGES` to the exact package IDs the sponsored
+   transactions may call
+6. Run your strategy — all transactions are now gas-sponsored
 
 See [docs/aftermath/gasless-trading.md](docs/aftermath/gasless-trading.md) for full details.
 
@@ -200,7 +206,6 @@ Post-relaunch references:
 
 - **Trigger orders**: `place_trigger_order` returns a tx digest, not the stop-order object ID. Cancellation requires the object ID from `stop-order-datas` (signed auth).
 - **No WebSocket orderbook**: Uses REST polling per tick. A WS subscription would reduce latency.
-- **Funding annualization**: `basis_arb` and Radar currently hard-code an eight-hour funding interval. With V2's hourly `estimatedFundingRate`, their displayed annualized Aftermath values are 8x too low. Trading-direction signals remain correct, but interval-aware annualization is tracked as follow-up work.
 - **APEX multi-slot**: Not yet integration-tested with Aftermath (should work via the same proxy interface).
 - **Not tested on mainnet with real funds**. Mock mode verified; live mode is API-correct but not battle-tested.
 

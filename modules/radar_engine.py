@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+from common.models import DEFAULT_FUNDING_INTERVAL_HOURS, annualize_funding_rate
 from modules.radar_config import RadarConfig
 from modules.radar_state import DisqualifiedAsset, Opportunity, RadarResult
 from modules.radar_technicals import (
@@ -30,6 +32,7 @@ class AssetMeta:
     funding_rate: float
     open_interest: float
     mark_price: float
+    funding_interval_hours: float = DEFAULT_FUNDING_INTERVAL_HOURS
 
 
 class OpportunityRadarEngine:
@@ -186,12 +189,25 @@ class OpportunityRadarEngine:
             if vol < self.config.min_volume_24h:
                 continue
 
+            raw_funding_interval = ctx.get("fundingIntervalHours")
+            if raw_funding_interval is None:
+                warnings.warn(
+                    "fundingIntervalHours missing; assuming 1h",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
             assets.append(AssetMeta(
                 name=name,
                 volume_24h=vol,
                 funding_rate=float(ctx.get("funding", 0)),
                 open_interest=float(ctx.get("openInterest", 0)),
                 mark_price=float(ctx.get("markPx", 0)),
+                funding_interval_hours=float(
+                    raw_funding_interval
+                    if raw_funding_interval is not None
+                    else DEFAULT_FUNDING_INTERVAL_HOURS
+                ),
             ))
 
         return assets
@@ -228,8 +244,23 @@ class OpportunityRadarEngine:
         patterns = detect_patterns(candles_1h)
         changes = price_changes(candles_1h)
 
-        # Funding annualized (assuming 8h funding period)
-        funding_ann_pct = abs(asset.funding_rate) * 3 * 365 * 100
+        try:
+            funding_ann_pct = (
+                abs(
+                    annualize_funding_rate(
+                        asset.funding_rate,
+                        asset.funding_interval_hours,
+                    )
+                )
+                * 100
+            )
+        except ValueError:
+            return DisqualifiedAsset(
+                asset=asset.name,
+                direction=direction,
+                reason="invalid_funding_interval",
+                details={"funding_interval_hours": asset.funding_interval_hours},
+            )
 
         # BTC macro modifier for this direction
         modifiers = btc_macro.get("modifiers", {})

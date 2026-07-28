@@ -23,6 +23,7 @@ import { SuiClient } from "@mysten/sui/client";
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { Transaction } from "@mysten/sui/transactions";
 import { fromBase64 } from "@mysten/sui/utils";
+import { assertSafeSponsoredTransaction } from "./_af_sponsor_guard.mjs";
 
 // Parse mode from args
 const args = process.argv.slice(2);
@@ -66,7 +67,15 @@ try {
     process.stdout.write(JSON.stringify({ address }) + "\n");
   } else {
     // Sign and submit transaction
-    const { txKind, privateKey, rpcUrl, sponsorSignature } = input;
+    const {
+      txKind,
+      privateKey,
+      rpcUrl,
+      sponsorSignature,
+      maxGasBudget,
+      maxGasPrice,
+      allowedPackages,
+    } = input;
 
     if (!txKind || !privateKey || !rpcUrl) {
       process.stderr.write(
@@ -88,20 +97,14 @@ try {
       // Sponsored responses contain full TransactionData with gas payment
       // already attached. Preserve those bytes, sign them as the sender, and
       // submit both sender and sponsor signatures.
-      const tx = Transaction.from(txBytes);
-      const txData = tx.getData();
-      const gasData = txData.gasData;
-      if (
-        !txData.sender ||
-        !gasData?.owner ||
-        !gasData?.budget ||
-        !gasData?.price ||
-        !gasData?.payment?.length
-      ) {
-        throw new Error(
-          "Sponsored txKind must contain fully resolved TransactionData"
-        );
-      }
+      const senderAddress = keypair.getPublicKey().toSuiAddress();
+      assertSafeSponsoredTransaction({
+        txBytes,
+        senderAddress,
+        maxGasBudget,
+        maxGasPrice,
+        allowedPackages,
+      });
 
       // The sponsor signed these exact bytes. Rebuilding could change gas
       // fields or object versions and invalidate the sponsor signature.
