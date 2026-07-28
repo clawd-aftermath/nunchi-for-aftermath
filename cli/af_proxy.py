@@ -19,8 +19,9 @@ Signing pipeline (mirrors TypeScript orders.ts):
 
 Required env vars:
   SUI_PRIVATE_KEY   - Bech32 (suiprivkey1...) or Base64 Ed25519 key
-  AF_BASE_URL       - Aftermath API base (default: https://aftermath.finance)
+  AF_BASE_URL       - Aftermath API base (default: https://v2-preview.aftermath.finance)
   AF_COLLATERAL_TYPE - USDC coin type (default: 0xdba3...::usdc::USDC)
+  AF_COLLATERAL_DECIMALS - Collateral token decimals (default: 6 for USDC)
   AF_SUI_RPC        - Sui fullnode RPC URL (default: auto from AF_BASE_URL)
 
 Optional:
@@ -37,7 +38,7 @@ import os
 import threading
 import time
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -52,13 +53,14 @@ ZERO = Decimal("0")
 # Constants
 # ---------------------------------------------------------------------------
 
-AF_BASE_URL_DEFAULT = "https://aftermath.finance"
+AF_BASE_URL_DEFAULT = "https://v2-preview.aftermath.finance"
 AF_COLLATERAL_TYPE_DEFAULT = (
     "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC"
 )
 AF_LEVERAGE_DEFAULT = 5
 WRITE_SETTLE_MS_DEFAULT = 2_000
 AUTO_COLLATERAL_ALLOCATE_AMOUNT_DEFAULT = 100.0
+AF_COLLATERAL_DECIMALS_DEFAULT = 6
 
 # Gas pool / sponsorship defaults
 # Set AF_SPONSOR_ADDRESS to enable gasless trading via GasPool.
@@ -89,6 +91,29 @@ def _settle_ms() -> int:
 def _to_native_int(value: float) -> str:
     """Convert float USD price/size to 9-decimal BigInt string (e.g. '65000500000000n')."""
     return f"{int(round(value * 1e9))}n"
+
+
+def _to_collateral_int(value: float) -> str:
+    """Convert a human collateral amount to native token units."""
+    raw_decimals = os.environ.get("AF_COLLATERAL_DECIMALS")
+    try:
+        decimals = (
+            int(raw_decimals)
+            if raw_decimals is not None
+            else AF_COLLATERAL_DECIMALS_DEFAULT
+        )
+    except ValueError:
+        decimals = AF_COLLATERAL_DECIMALS_DEFAULT
+    decimals = min(max(decimals, 0), 18)
+    decimal_value = Decimal(str(value))
+    native_amount = int(decimal_value.scaleb(decimals))
+    if decimal_value < 0:
+        raise ValueError("Collateral allocation amount must be non-negative")
+    if decimal_value > 0 and native_amount == 0:
+        raise ValueError(
+            f"Collateral allocation amount is below {decimals}-decimal precision"
+        )
+    return f"{native_amount}n"
 
 
 def _order_type_from_tif(tif: str) -> int:
@@ -192,17 +217,27 @@ def _fetch_markets(base_url: str) -> Dict[str, Any]:
     """Fetch all Aftermath markets keyed by base asset."""
     resp = _request_with_retry("GET", f"{base_url}/api/ccxt/markets", timeout=15)
     resp.raise_for_status()
-    raw: Dict[str, Any] = resp.json()
+    raw = resp.json()
+    if isinstance(raw, dict):
+        market_rows = list(raw.values())
+    elif isinstance(raw, list):
+        market_rows = raw
+    else:
+        raise RuntimeError(f"Unexpected /api/ccxt/markets response: {type(raw).__name__}")
+
     result: Dict[str, Any] = {}
-    for mkt in raw.values():
+    for mkt in market_rows:
+        if not isinstance(mkt, dict):
+            continue
         if mkt.get("active") and mkt.get("swap"):
             base = mkt["base"].upper()
+            limits = mkt.get("limits") or {}
             result[base] = {
                 "chId": mkt["id"],
                 "symbol": mkt["symbol"],
                 "base": base,
                 "tickSize": mkt.get("precision", {}).get("price", 0.01),
-                "minSize": mkt.get("limits", {}).get("amount", {}).get("min", 0.001),
+                "minSize": (limits.get("amount") or {}).get("min", 0.001),
                 "raw": mkt,
             }
     return result
@@ -229,7 +264,10 @@ def _fetch_all_markets(base_url: str) -> Dict[str, Any]:
     )
     resp.raise_for_status()
     raw = resp.json()
-    markets = raw.get("marketStates") if isinstance(raw, dict) else raw
+    if isinstance(raw, dict):
+        markets = raw.get("markets", raw.get("marketStates", []))
+    else:
+        markets = raw
     result: Dict[str, Any] = {}
     if isinstance(markets, dict):
         for market_id, market_state in markets.items():
@@ -239,9 +277,13 @@ def _fetch_all_markets(base_url: str) -> Dict[str, Any]:
         for item in markets:
             if not isinstance(item, dict):
                 continue
-            market_id = item.get("marketId") or item.get("id")
+            market_id = item.get("marketId") or item.get("objectId") or item.get("id")
             if market_id:
-                result[str(market_id)] = item
+                market_state = item.get("marketState")
+                if isinstance(market_state, dict):
+                    result[str(market_id)] = {**item, **market_state}
+                else:
+                    result[str(market_id)] = item
     return result
 
 
@@ -332,7 +374,7 @@ def _fetch_account_info(base_url: str, wallet_address: str) -> Dict[str, Any]:
         acc_id = int(acc_id)
     return {
         "accountNumber": acc_id,
-        "accountCapId": cap.get("id", ""),
+        "accountCapId": cap.get("objectId") or cap.get("id", ""),
         "walletAddress": wallet_address,
     }
 
@@ -468,15 +510,19 @@ def _sign_and_submit(
     it is passed to the Node.js signer so both the agent's signature and the
     sponsor's signature are submitted together.
     """
-    tx_kind_bytes = base64.b64decode(tx_kind_b64)
-
     # 1. Try Node.js helper (always works if node + @mysten/sui installed)
     try:
         return _node_sign_submit(private_key, tx_kind_b64, rpc_url, sponsor_signature=sponsor_signature)
     except FileNotFoundError:
         log.debug("Node signer script not found, trying pysui/nacl fallback")
     except Exception as e:
+        if sponsor_signature:
+            raise RuntimeError(
+                "Sponsored transaction signing requires the bundled Node.js signer"
+            ) from e
         log.warning("Node signer failed, trying pysui/nacl fallback: %s", e)
+
+    tx_kind_bytes = base64.b64decode(tx_kind_b64)
 
     # 2. Try pysui
     try:
@@ -505,15 +551,10 @@ def _sign_and_submit(
 def _pysui_sign_submit(private_key: str, tx_kind_bytes: bytes, rpc_url: str) -> str:
     """Sign and submit using pysui SDK."""
     from pysui import SuiConfig, SyncClient  # type: ignore[import-untyped]
-    from pysui.sui.sui_txn import SyncTransaction  # type: ignore[import-untyped]
 
     cfg = SuiConfig.user_config(rpc_url=rpc_url, prv_keys=[private_key])
     client = SyncClient(cfg)
     signer = cfg.active_address
-
-    # Wrap txKind bytes into a Transaction
-    from pysui.sui.sui_types.bcs import TransactionKind  # type: ignore[import-untyped]
-    from pysui.abstracts.client_keypair import KeyPair  # type: ignore[import-untyped]
 
     result = client.sign_and_submit(
         signer=signer,
@@ -608,33 +649,61 @@ def _fetch_snapshot(base_url: str, instrument: str) -> MarketSnapshot:
     resp.raise_for_status()
     books = resp.json()
 
-    # Response shape: list of { marketId, bids: [[price, size], ...], asks: [...] }
-    # or dict keyed by marketId
-    if isinstance(books, dict):
-        book = books.get(ch_id, {})
+    # V2 response: { orderbooks: [{ marketId, orderbook: { bids, asks, ... } }] }.
+    # Keep the older list/dict variants for self-hosted compatibility.
+    if isinstance(books, dict) and isinstance(books.get("orderbooks"), list):
+        entry = next(
+            (b for b in books["orderbooks"] if b.get("marketId") == ch_id),
+            {},
+        )
+        book = entry.get("orderbook", {})
+    elif isinstance(books, dict):
+        entry = books.get(ch_id, {})
+        book = entry.get("orderbook", entry) if isinstance(entry, dict) else {}
     elif isinstance(books, list):
-        book = next((b for b in books if b.get("marketId") == ch_id), {})
+        entry = next((b for b in books if b.get("marketId") == ch_id), {})
+        book = entry.get("orderbook", entry)
     else:
         book = {}
 
     bids = book.get("bids", [])
     asks = book.get("asks", [])
 
-    # Sort to get best bid/ask
-    if bids:
-        bids_sorted = sorted(bids, key=lambda x: -float(x[0]))
-        best_bid = float(bids_sorted[0][0])
-    else:
-        best_bid = 0.0
+    def _positive_level_prices(levels: Any) -> List[float]:
+        prices: List[float] = []
+        if not isinstance(levels, list):
+            return prices
+        for level in levels:
+            try:
+                if isinstance(level, dict):
+                    raw_price = level.get("price")
+                    raw_size = level.get("size")
+                else:
+                    raw_price = level[0]
+                    raw_size = level[1]
+                price = float(raw_price)
+                size = float(raw_size)
+            except (IndexError, KeyError, TypeError, ValueError):
+                continue
+            if price > 0 and size > 0:
+                prices.append(price)
+        return prices
 
-    if asks:
-        asks_sorted = sorted(asks, key=lambda x: float(x[0]))
-        best_ask = float(asks_sorted[0][0])
-    else:
-        best_ask = 0.0
+    bid_prices = _positive_level_prices(bids)
+    ask_prices = _positive_level_prices(asks)
+    if not bid_prices or not ask_prices:
+        raise RuntimeError(f"Aftermath orderbook unavailable for {instrument}")
 
-    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
-    spread_bps = ((best_ask - best_bid) / mid * 10_000) if mid > 0 else 0.0
+    best_bid = max(bid_prices)
+    best_ask = min(ask_prices)
+    if best_bid >= best_ask:
+        raise RuntimeError(
+            f"Aftermath orderbook is crossed for {instrument}: "
+            f"bid={best_bid}, ask={best_ask}"
+        )
+
+    mid = (best_bid + best_ask) / 2
+    spread_bps = (best_ask - best_bid) / mid * 10_000
 
     # Fetch 24h stats for volume/open interest
     funding_rate = 0.0
@@ -649,24 +718,31 @@ def _fetch_snapshot(base_url: str, instrument: str) -> MarketSnapshot:
         )
         if stats_resp.ok:
             stats = stats_resp.json()
-            if isinstance(stats, dict):
+            if isinstance(stats, dict) and isinstance(stats.get("marketsStats"), list):
+                rows = stats["marketsStats"]
+                if len(rows) == 1:
+                    row = rows[0]
+                    row_market_id = row.get("marketId") if isinstance(row, dict) else None
+                    s = row if row_market_id in (None, ch_id) else {}
+                else:
+                    s = {}
+            elif isinstance(stats, dict):
                 s = stats.get(ch_id, {})
             elif isinstance(stats, list):
                 s = next((x for x in stats if x.get("marketId") == ch_id), {})
             else:
                 s = {}
-            volume_24h = float(s.get("volume24h", 0) or 0)
+            volume_24h = float(s.get("volumeUsd", s.get("volume24h", 0)) or 0)
             open_interest = float(s.get("openInterest", 0) or 0)
     except Exception:
         pass
 
-    # Gotcha #18: 24hr-stats fundingRate is inflated. Use all-markets premiumTwap/indexPrice.
     try:
         market_state = _all_markets(base_url).get(ch_id, {})
-        premium_twap = float(market_state.get("premiumTwap", 0) or 0)
-        index_price = float(market_state.get("indexPrice", 0) or 0)
-        if index_price > 0:
-            funding_rate = premium_twap / index_price
+        # V2 estimates the rate for fundingFrequencyMs. For current markets,
+        # this is premiumTwap/indexPrice scaled by frequency/period.
+        funding_rate = float(market_state.get("estimatedFundingRate", 0) or 0)
+        open_interest = float(market_state.get("openInterest", open_interest) or 0)
     except Exception:
         pass
 
@@ -765,9 +841,8 @@ def _preview_limit_order(
     )
     resp.raise_for_status()
     data = resp.json()
-    if data.get("error"):
-        log.warning("Preview error: %s", data["error"])
-        return {"collateralChange": 0, "hasPosition": False, "cancelSlTp": False}
+    if data.get("error") or resp.headers.get("X-Error-Message") == "true":
+        raise RuntimeError(data.get("error", "Aftermath preview failed"))
     return data
 
 
@@ -791,11 +866,12 @@ def _place_order_native(
 
     order_type = _order_type_from_tif(tif)
 
+    has_pos = _has_position(base_url, account_number, instrument)
+
     # For PostOnly orders, collateralChange=0 (collateral must be pre-allocated).
     # For GTC/IOC/FOK orders, preview first to get the correct collateralChange
     # (critical for first-trade on a market with no existing position/collateral).
     if order_type == 2:  # PostOnly
-        has_pos = _has_position(base_url, account_number, instrument)
         collateral_change = 0
         cancel_sl_tp = False
     else:
@@ -803,7 +879,7 @@ def _place_order_native(
             base_url, account_number, ch_id, native_side, size, price, order_type, leverage
         )
         collateral_change = preview.get("collateralChange", 0)
-        has_pos = preview.get("hasPosition", _has_position(base_url, account_number, instrument))
+        has_pos = preview.get("hasPosition", has_pos)
         cancel_sl_tp = preview.get("cancelSlTp", False)
 
     body: Dict[str, Any] = {
@@ -876,6 +952,8 @@ def _cancel_orders_native(
         "orderType": 2,  # PostOnly
         "reduceOnly": False,
         "hasPosition": has_pos,
+        "shouldAbortOnMissingId": False,
+        "shouldDeallocateFreeCollateral": False,
     }
     _add_sponsor_to_body(body)
 
@@ -971,17 +1049,6 @@ def _get_candles(base_url: str, instrument: str, interval: str, lookback_ms: int
         mkt = _get_market(base_url, instrument)
         ch_id = mkt["chId"]
 
-        # Map interval string to ms
-        interval_ms_map = {
-            "1m": 60_000,
-            "5m": 300_000,
-            "15m": 900_000,
-            "1h": 3_600_000,
-            "4h": 14_400_000,
-            "1d": 86_400_000,
-        }
-        interval_ms = interval_ms_map.get(interval, 3_600_000)
-
         end_ms = int(time.time() * 1000)
         start_ms = end_ms - lookback_ms
 
@@ -990,9 +1057,9 @@ def _get_candles(base_url: str, instrument: str, interval: str, lookback_ms: int
             f"{base_url}/api/perpetuals/market/candle-history",
             json={
                 "marketId": ch_id,
-                "intervalMs": interval_ms,
-                "fromTimestampMs": start_ms,
-                "toTimestampMs": end_ms,
+                "resolution": interval,
+                "fromTimestamp": start_ms,
+                "toTimestamp": end_ms,
             },
             timeout=15,
         )
@@ -1035,7 +1102,23 @@ def _get_all_markets_hl_format(base_url: str) -> Any:
         )
         stats_resp.raise_for_status()
         stats_raw = stats_resp.json()
-        if isinstance(stats_raw, dict):
+        if isinstance(stats_raw, dict) and isinstance(stats_raw.get("marketsStats"), list):
+            rows = stats_raw["marketsStats"]
+            rows_with_ids = [
+                row
+                for row in rows
+                if isinstance(row, dict) and row.get("marketId")
+            ]
+            if rows_with_ids:
+                stats_by_id = {
+                    str(row["marketId"]): row
+                    for row in rows_with_ids
+                }
+            elif len(rows) == len(ch_ids):
+                stats_by_id = dict(zip(ch_ids, rows))
+            else:
+                stats_by_id = {}
+        elif isinstance(stats_raw, dict):
             stats_by_id = stats_raw
         elif isinstance(stats_raw, list):
             stats_by_id = {s["marketId"]: s for s in stats_raw if "marketId" in s}
@@ -1051,15 +1134,16 @@ def _get_all_markets_hl_format(base_url: str) -> Any:
         ch_id = mkt["chId"]
         s = stats_by_id.get(ch_id, {})
         market_state = all_markets_state.get(ch_id, {})
-        premium_twap = float(market_state.get("premiumTwap", 0) or 0)
-        index_price = float(market_state.get("indexPrice", 0) or 0)
-        funding = (premium_twap / index_price) if index_price > 0 else 0.0
+        funding = float(market_state.get("estimatedFundingRate", 0) or 0)
         mark_px = market_state.get("markPrice") or s.get("markPrice", "0") or "0"
+        prev_day_px = market_state.get("indexPrice24hrsAgo") or s.get("prevDayPx")
+        if prev_day_px is None and s.get("basePrice") is not None:
+            prev_day_px = float(s["basePrice"]) - float(s.get("priceChange", 0) or 0)
         asset_ctxs.append({
             "funding": str(funding),
             "openInterest": str(market_state.get("openInterest", s.get("openInterest", "0")) or "0"),
-            "prevDayPx": str(market_state.get("indexPrice24hrsAgo", s.get("prevDayPx", "0")) or "0"),
-            "dayNtlVlm": str(s.get("volume24h", "0") or "0"),
+            "prevDayPx": str(prev_day_px or "0"),
+            "dayNtlVlm": str(s.get("volumeUsd", s.get("volume24h", "0")) or "0"),
             "markPx": str(mark_px),
         })
     return [{"universe": universe}, asset_ctxs]
@@ -1080,6 +1164,8 @@ def _get_all_mids(base_url: str) -> Dict[str, str]:
         )
         resp.raise_for_status()
         prices = resp.json()
+        if isinstance(prices, dict) and isinstance(prices.get("marketsPrices"), list):
+            prices = prices["marketsPrices"]
         if isinstance(prices, dict):
             for base, mkt in mkts.items():
                 ch_id = mkt["chId"]
@@ -1221,6 +1307,7 @@ class AftermathProxy:
                 "leverage": float(leverage),
                 "collateralChange": 0,
             }
+            _add_sponsor_to_body(body)
             resp = _request_with_retry(
                 "POST",
                 f"{self._base_url}/api/perpetuals/account/transactions/set-leverage",
@@ -1236,7 +1323,11 @@ class AftermathProxy:
             if tx_kind_b64:
                 with _write_lock:
                     digest = _sign_and_submit(
-                        self._private_key, tx_kind_b64, self._base_url, self._rpc_url
+                        self._private_key,
+                        tx_kind_b64,
+                        self._base_url,
+                        self._rpc_url,
+                        sponsor_signature=data.get("sponsorSignature"),
                     )
                     time.sleep(_settle_ms() / 1000.0)
                 log.info("Leverage set to %dx for %s: %s", leverage, base, digest)
@@ -1253,8 +1344,9 @@ class AftermathProxy:
                 "accountId": f"{acc_num}n",
                 "walletAddress": self._wallet_address,
                 "marketId": ch_id,
-                "amount": float(amount),
+                "allocateAmount": _to_collateral_int(amount),
             }
+            _add_sponsor_to_body(body)
 
             with _write_lock:
                 resp = _request_with_retry(
@@ -1271,7 +1363,11 @@ class AftermathProxy:
                 if not tx_kind_b64:
                     return None
                 digest = _sign_and_submit(
-                    self._private_key, tx_kind_b64, self._base_url, self._rpc_url
+                    self._private_key,
+                    tx_kind_b64,
+                    self._base_url,
+                    self._rpc_url,
+                    sponsor_signature=data.get("sponsorSignature"),
                 )
                 time.sleep(_settle_ms() / 1000.0)
 
@@ -1384,6 +1480,8 @@ class AftermathProxy:
                     "reduceOnly": False,
                     "hasPosition": has_pos,
                     "leverage": float(self._leverage),
+                    "shouldAbortOnMissingId": False,
+                    "shouldDeallocateFreeCollateral": False,
                 }
                 _add_sponsor_to_body(body)
 
@@ -1524,7 +1622,7 @@ class AftermathProxy:
 
             stop_order = {
                 "marketId": ch_id,
-                "size": int(round(size * 1e9)),  # native int, no "n" suffix for this endpoint
+                "size": _to_native_int(size),
                 "side": native_side,
                 "nonSlTp": {
                     "stopIndexPrice": trigger_price,
@@ -1534,10 +1632,11 @@ class AftermathProxy:
             }
 
             body = {
-                "accountId": acc_num,
+                "accountId": f"{acc_num}n",
                 "walletAddress": self._wallet_address,
                 "stopOrders": [stop_order],
             }
+            _add_sponsor_to_body(body)
             resp = _request_with_retry(
                 "POST",
                 f"{self._base_url}/api/perpetuals/account/transactions/place-stop-orders",
@@ -1554,7 +1653,11 @@ class AftermathProxy:
                 return None
             with _write_lock:
                 digest = _sign_and_submit(
-                    self._private_key, tx_kind_b64, self._base_url, self._rpc_url
+                    self._private_key,
+                    tx_kind_b64,
+                    self._base_url,
+                    self._rpc_url,
+                    sponsor_signature=data.get("sponsorSignature"),
                 )
                 time.sleep(_settle_ms() / 1000.0)
 
@@ -1585,10 +1688,11 @@ class AftermathProxy:
             acc_num = self._account_number()
 
             body = {
-                "accountId": acc_num,
+                "accountId": f"{acc_num}n",
                 "walletAddress": self._wallet_address,
                 "stopOrderIds": [oid],
             }
+            _add_sponsor_to_body(body)
             resp = _request_with_retry(
                 "POST",
                 f"{self._base_url}/api/perpetuals/account/transactions/cancel-stop-orders",
@@ -1604,7 +1708,11 @@ class AftermathProxy:
             if tx_kind_b64:
                 with _write_lock:
                     _sign_and_submit(
-                        self._private_key, tx_kind_b64, self._base_url, self._rpc_url
+                        self._private_key,
+                        tx_kind_b64,
+                        self._base_url,
+                        self._rpc_url,
+                        sponsor_signature=data.get("sponsorSignature"),
                     )
                     time.sleep(_settle_ms() / 1000.0)
             return True

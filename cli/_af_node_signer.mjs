@@ -2,8 +2,8 @@
 /**
  * Sui transaction signer for Aftermath proxy.
  *
- * Wraps a raw TransactionKind (base64) into a full Transaction,
- * signs it with the given Ed25519 key, and submits to the Sui RPC.
+ * Signs either an unsponsored TransactionKind or a sponsored full
+ * Transaction returned by the Aftermath V2 API, then submits to Sui.
  *
  * Usage:
  *   echo '{"txKind":"...","privateKey":"suiprivkey1...","rpcUrl":"..."}' | node _af_node_signer.mjs --stdin
@@ -66,7 +66,7 @@ try {
     process.stdout.write(JSON.stringify({ address }) + "\n");
   } else {
     // Sign and submit transaction
-    const { txKind, privateKey, rpcUrl } = input;
+    const { txKind, privateKey, rpcUrl, sponsorSignature } = input;
 
     if (!txKind || !privateKey || !rpcUrl) {
       process.stderr.write(
@@ -78,19 +78,54 @@ try {
     const keypair = Ed25519Keypair.fromSecretKey(privateKey);
     const client = new SuiClient({ url: rpcUrl });
 
-    const txKindBytes = fromBase64(txKind);
-    const tx = Transaction.fromKind(txKindBytes);
+    const txBytes = fromBase64(txKind);
+    if (!(txBytes instanceof Uint8Array)) {
+      throw new Error("txKind must decode to transaction bytes");
+    }
+    let result;
 
-    const result = await client.signAndExecuteTransaction({
-      transaction: tx,
-      signer: keypair,
-      options: { showEffects: true },
-    });
+    if (sponsorSignature) {
+      // Sponsored responses contain full TransactionData with gas payment
+      // already attached. Preserve those bytes, sign them as the sender, and
+      // submit both sender and sponsor signatures.
+      const tx = Transaction.from(txBytes);
+      const txData = tx.getData();
+      const gasData = txData.gasData;
+      if (
+        !txData.sender ||
+        !gasData?.owner ||
+        !gasData?.budget ||
+        !gasData?.price ||
+        !gasData?.payment?.length
+      ) {
+        throw new Error(
+          "Sponsored txKind must contain fully resolved TransactionData"
+        );
+      }
+
+      // The sponsor signed these exact bytes. Rebuilding could change gas
+      // fields or object versions and invalidate the sponsor signature.
+      const { signature } = await keypair.signTransaction(txBytes);
+      result = await client.executeTransactionBlock({
+        transactionBlock: txBytes,
+        signature: [signature, sponsorSignature],
+        options: { showEffects: true },
+      });
+    } else {
+      const tx = Transaction.fromKind(txBytes);
+      result = await client.signAndExecuteTransaction({
+        transaction: tx,
+        signer: keypair,
+        options: { showEffects: true },
+      });
+    }
 
     const status = result.effects?.status?.status;
-    if (status === "failure") {
+    if (status !== "success") {
       const err = result.effects?.status?.error ?? "unknown";
-      process.stderr.write(`Transaction failed on-chain: ${err}\n`);
+      process.stderr.write(
+        `Transaction ${result.digest ?? "unknown"} failed on-chain: ${err}\n`
+      );
       process.exit(1);
     }
 

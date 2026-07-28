@@ -32,7 +32,7 @@ Distributes size across a price range in a single transaction. Useful for DCA-st
 
 For live orderbook and trade updates, connect to the WebSocket endpoint:
 
-`wss://aftermath.finance/api/perpetuals/ws/updates`
+`wss://v2-preview.aftermath.finance/api/perpetuals/ws/updates`
 
 This supports subscriptions to orderbook updates, trade events, oracle prices, and account-level order and collateral changes. SSE streams are available under `/api/ccxt/stream/*`.
 
@@ -98,4 +98,4 @@ POST /api/perpetuals/account/transactions/cancel-and-place-orders
 
 If your firm already runs on CCXT infrastructure, the CCXT standard interface is supported as well. Note that CCXT endpoints return `transactionBytes` and `signingDigest` rather than raw `TransactionKind`, so you have less control over gas and PTB composition.
 
-Full API reference: https://aftermath.finance/docs
+Full API reference: https://v2-preview.aftermath.finance/docs

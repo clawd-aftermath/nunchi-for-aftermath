@@ -79,7 +79,7 @@ hl apex run --mainnet
 
 ## Aftermath Finance (Sui)
 
-All 14 strategies can run on [Aftermath Finance](https://aftermath.finance) perpetuals on Sui instead of Hyperliquid. The `AftermathProxy` is a drop-in replacement for the Hyperliquid proxy — strategy code is unchanged.
+All 14 strategies can run on [Aftermath V2](https://v2-preview.aftermath.finance) perpetuals on Sui instead of Hyperliquid. The `AftermathProxy` is a drop-in replacement for the Hyperliquid proxy — strategy code is unchanged.
 
 ### Setup
 
@@ -92,7 +92,7 @@ pip install -r requirements-af.txt    # optional: PyNaCl, bech32
 
 # 3. Set env vars
 export SUI_PRIVATE_KEY=suiprivkey1...    # or base64 Ed25519 key
-export AF_BASE_URL=https://aftermath.finance
+export AF_BASE_URL=https://v2-preview.aftermath.finance
 ```
 
 ### Usage
@@ -122,7 +122,8 @@ hl af simple_mm -i XAG-AF-PERP --tick 10
 | Variable | Default | Description |
 |---|---|---|
 | `SUI_PRIVATE_KEY` | required | Bech32 (`suiprivkey1...`) or base64 Ed25519 key |
-| `AF_BASE_URL` | `https://aftermath.finance` | API base URL |
+| `AF_BASE_URL` | `https://v2-preview.aftermath.finance` | Post-relaunch API base URL |
+| `AF_COLLATERAL_DECIMALS` | `6` | Collateral token decimals used when allocating human-readable amounts |
 | `AF_LEVERAGE` | `5` | Default leverage for new positions |
 | `AF_ACCOUNT_NUMBER` | auto-discovered | Override numeric account ID |
 | `AF_SUI_RPC` | auto (mainnet/testnet) | Sui fullnode RPC URL |
@@ -149,7 +150,7 @@ TradingEngine / OrderManager / Guard / Radar / Pulse
   Sui blockchain (signAndExecuteTransaction)
 ```
 
-The signing pipeline uses `Transaction.fromKind()` from `@mysten/sui` — the same pattern as the Aftermath TypeScript SDK. All writes are serialized to prevent stale Sui object races.
+The signing pipeline uses `Transaction.fromKind()` for unsponsored V2 transaction kinds. Sponsored responses contain fully resolved transaction data; the signer validates and signs those exact bytes so it does not invalidate the sponsor signature. All writes are serialized to prevent stale Sui object races.
 
 ### Optimizations
 
@@ -158,7 +159,7 @@ The proxy uses Aftermath's most efficient patterns:
 - **Atomic cancel-and-place**: The `OrderManager` detects the AF proxy and batches all order cancellations + new placements into a single `cancel-and-place-orders` Sui transaction. This saves ~7x gas compared to individual cancel + place calls.
 - **Gasless trading (GasPool)**: Set `AF_SPONSOR_ADDRESS` to a primary wallet that owns a GasPool. The agent wallet never needs SUI — gas is drawn from the pool automatically. Supports depositing USDC into the gas pool (auto-swaps to SUI via Aftermath router).
 - **Auto collateral allocation**: Before the first PostOnly order on a market, the proxy automatically calls `allocate-collateral` to pre-fund the position. No manual collateral management needed.
-- **Correct funding rate**: Uses `premiumTwap / indexPrice` from `/api/perpetuals/all-markets` instead of the inflated `estimatedFundingRate` field.
+- **Canonical funding rate**: Uses the periodic `estimatedFundingRate` from the V2 `/api/perpetuals/all-markets` response. For current markets, that is an hourly rate and replaces the full eight-hour premium previously exposed by the proxy. Cross-venue funding consumers now receive the expected hourly value.
 - **Position cache**: `hasPosition` is cached for 10s per market to avoid redundant API calls during multi-order ticks. Cache invalidates after every write.
 - **Retry with backoff**: All HTTP calls retry 3x with exponential backoff on 429/5xx/timeout.
 
@@ -188,12 +189,18 @@ Comprehensive integration docs are included in the repo:
 
 ### Aftermath Perpetuals Skill
 
-A comprehensive agent skill for Aftermath integration is included at [`skills/aftermath-perpetuals/`](skills/aftermath-perpetuals/SKILL.md). It covers native endpoints, CCXT compatibility, TypeScript SDK, error handling, safety/risk patterns, market making optimization, and gotchas.
+The canonical, maintained Aftermath integration skills live in [`AftermathFinance/skills`](https://github.com/AftermathFinance/skills). The local `skills/aftermath-perpetuals/` directory is retained for compatibility with the CLI's bundled skill registry.
+
+Post-relaunch references:
+
+- [Swagger API](https://v2-preview.aftermath.finance/docs)
+- [OpenAPI JSON](https://v2-preview.aftermath.finance/api/openapi/spec.json)
 
 ### Known limitations
 
 - **Trigger orders**: `place_trigger_order` returns a tx digest, not the stop-order object ID. Cancellation requires the object ID from `stop-order-datas` (signed auth).
 - **No WebSocket orderbook**: Uses REST polling per tick. A WS subscription would reduce latency.
+- **Funding annualization**: `basis_arb` and Radar currently hard-code an eight-hour funding interval. With V2's hourly `estimatedFundingRate`, their displayed annualized Aftermath values are 8x too low. Trading-direction signals remain correct, but interval-aware annualization is tracked as follow-up work.
 - **APEX multi-slot**: Not yet integration-tested with Aftermath (should work via the same proxy interface).
 - **Not tested on mainnet with real funds**. Mock mode verified; live mode is API-correct but not battle-tested.
 
