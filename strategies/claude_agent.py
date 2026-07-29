@@ -1,4 +1,4 @@
-"""LLM-powered trading agent — supports Claude and Gemini.
+"""LLM-powered trading agent — supports Claude, Gemini, OpenAI, and ClawRouter.
 
 Uses structured tool/function calling to make trading decisions each tick.
 The LLM receives market data, position state, and risk context, then decides
@@ -14,6 +14,9 @@ Usage:
 
     # Gemini Flash
     hl run claude_agent -i ETH-PERP --tick 15 --model gemini-2.0-flash
+
+    # ClawRouter (x402 — pay with USDC, no API key needed)
+    hl run claude_agent -i ETH-PERP --tick 15 --model blockrun/auto
 """
 from __future__ import annotations
 
@@ -103,6 +106,8 @@ TOOLS = [
 
 def _detect_provider(model: str) -> str:
     """Detect LLM provider from model name."""
+    if model.startswith("blockrun"):
+        return "blockrun"
     if model.startswith("gemini"):
         return "gemini"
     if model.startswith("claude"):
@@ -152,6 +157,7 @@ class ClaudeStrategy(BaseStrategy):
         self._anthropic_client = None
         self._gemini_client = None
         self._openai_client = None
+        self._blockrun_client = None
 
     # ------------------------------------------------------------------
     # Client initialization
@@ -436,6 +442,74 @@ class ClaudeStrategy(BaseStrategy):
         return decisions
 
     # ------------------------------------------------------------------
+    # ClawRouter / BlockRun backend (x402 — pay with USDC, no API key)
+    # ------------------------------------------------------------------
+
+    def _get_blockrun_client(self):
+        """Create OpenAI-compatible client pointing at ClawRouter local proxy.
+
+        ClawRouter (github.com/BlockRunAI/ClawRouter) runs on localhost:8402
+        and exposes an OpenAI-compatible API. Auth is handled by x402 wallet
+        signatures — no API key needed. The dummy key "x402" satisfies the
+        OpenAI client's required api_key param.
+        """
+        if self._blockrun_client is None:
+            try:
+                import openai
+            except ImportError:
+                raise ImportError(
+                    "openai package required for ClawRouter. Install: pip3 install openai"
+                )
+            from cli.x402_config import X402Config
+            cfg = X402Config.from_env()
+            base_url = f"{cfg.proxy_url}/v1"
+            # x402 uses wallet-based auth, not API keys.
+            # "x402" is a dummy key to satisfy the OpenAI client constructor.
+            self._blockrun_client = openai.OpenAI(api_key="x402", base_url=base_url)
+            log.info("ClawRouter client initialized: %s (chain=%s)", base_url, cfg.payment_chain)
+        return self._blockrun_client
+
+    def _call_blockrun(self, user_msg: str, snapshot: MarketSnapshot) -> List[StrategyDecision]:
+        """Route through ClawRouter — OpenAI-compatible, x402 payment."""
+        import json as _json
+
+        client = self._get_blockrun_client()
+        t0 = time.time()
+
+        # ClawRouter accepts OpenAI format; model can be "blockrun/auto" for
+        # smart routing or a specific model like "blockrun/claude-sonnet"
+        response = client.chat.completions.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            tools=self._build_openai_tools(),
+            tool_choice="required",
+        )
+
+        elapsed_ms = (time.time() - t0) * 1000
+        self._api_calls += 1
+        usage = response.usage
+        if usage:
+            self._total_input_tokens += usage.prompt_tokens or 0
+            self._total_output_tokens += usage.completion_tokens or 0
+            log.info(
+                "ClawRouter: %dms, %d/%d tokens (total: %d calls, %d/%d tokens)",
+                elapsed_ms, usage.prompt_tokens or 0, usage.completion_tokens or 0,
+                self._api_calls, self._total_input_tokens, self._total_output_tokens,
+            )
+
+        decisions = []
+        msg = response.choices[0].message
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                args = _json.loads(tc.function.arguments) if tc.function.arguments else {}
+                decisions.extend(self._parse_tool_call(tc.function.name, args, snapshot))
+        return decisions
+
+    # ------------------------------------------------------------------
     # Shared tool call parsing
     # ------------------------------------------------------------------
 
@@ -500,7 +574,9 @@ class ClaudeStrategy(BaseStrategy):
 
         try:
             provider = _detect_provider(self.model)
-            if provider == "gemini":
+            if provider == "blockrun":
+                decisions = self._call_blockrun(user_msg, snapshot)
+            elif provider == "gemini":
                 decisions = self._call_gemini(user_msg, snapshot)
             elif provider == "claude":
                 decisions = self._call_claude(user_msg, snapshot)

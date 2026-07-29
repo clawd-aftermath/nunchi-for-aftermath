@@ -35,7 +35,7 @@ dependencies = [
 [project.optional-dependencies]
 llm = ["anthropic>=0.40.0"]
 mcp = ["mcp>=1.0.0"]
-dev = ["pytest>=7.0", "ruff>=0.4.0"]
+dev = ["pytest>=7.0", "ruff>=0.4.0", "mypy>=1.8.0"]
 
 [project.scripts]
 hl = "cli.main:main"
@@ -44,5 +44,15 @@ hl = "cli.main:main"
 Homepage = "https://github.com/Nunchi-trade/agent-cli"
 Repository = "https://github.com/Nunchi-trade/agent-cli"
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
 [tool.setuptools.packages.find]
-include = ["cli*", "strategies*", "sdk*", "common*", "parent*", "modules*", "skills*"]
+include = ["cli*", "strategies*", "sdk*", "common*", "parent*", "modules*", "skills*", "quoting_engine*"]

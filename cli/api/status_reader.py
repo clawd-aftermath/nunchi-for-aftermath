@@ -56,6 +56,11 @@ def _read_apex_state(apex_dir: str) -> Dict[str, Any] | None:
     metrics = _read_trade_metrics(apex_dir)
     account = _read_account(apex_dir)
     override = _read_config_override(apex_dir)
+    # Health/error fields written by ApexRunner._persist_metrics. The dashboard
+    # FE uses these to render a banner when the agent is unfunded or having
+    # orders rejected, instead of showing "RUNNING" while the agent silently
+    # fails. See standalone_runner.py:_persist_metrics for the producer side.
+    runtime_metrics = _read_runtime_metrics(apex_dir)
 
     return {
         "engine": "apex",
@@ -90,7 +95,26 @@ def _read_apex_state(apex_dir: str) -> Dict[str, Any] | None:
         "account": account,
         "preset": override.get("preset") or state.get("preset", "default"),
         "network": "testnet" if os.environ.get("HL_TESTNET", "true").lower() == "true" else "mainnet",
+        # Surfaced agent health: error_state is one of None / "unfunded" /
+        # "preflight_failed" / "order_rejected"; can_trade is a boolean the
+        # FE uses to gate the dashboard rendering. error_detail is a
+        # human-readable string for tooltip / banner copy.
+        "error_state": runtime_metrics.get("error_state"),
+        "error_detail": runtime_metrics.get("error_detail"),
+        "can_trade": runtime_metrics.get("can_trade", True),
     }
+
+
+def _read_runtime_metrics(apex_dir: str) -> Dict[str, Any]:
+    """Read metrics.json (runtime metrics + agent health) if it exists."""
+    metrics_path = Path(apex_dir) / "metrics.json"
+    if not metrics_path.exists():
+        return {}
+    try:
+        with open(metrics_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
 
 
 def _read_trade_metrics(apex_dir: str) -> Dict[str, Any]:

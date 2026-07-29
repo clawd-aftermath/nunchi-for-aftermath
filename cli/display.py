@@ -5,6 +5,8 @@ import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from common.models import instrument_to_asset
+
 # ANSI color codes
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -44,7 +46,7 @@ def tick_line(
 ) -> str:
     """One-line tick summary for console output."""
     ts = time.strftime("%H:%M:%S")
-    coin = instrument.replace("-PERP", "").replace("-USDYP", "")
+    coin = instrument_to_asset(instrument)
 
     pos_str = f"{_sign(pos_qty)}" if pos_qty != 0 else "flat"
     entry_str = f" @ {avg_entry:.2f}" if pos_qty != 0 else ""
@@ -142,13 +144,26 @@ def strategy_table(registry: Dict[str, Dict[str, Any]]) -> str:
 
 def account_table(state: Dict[str, Any]) -> str:
     """Format account state for `hl account`."""
+    perp_value = state.get("account_value", 0)
+    spot_usdc = state.get("spot_usdc", 0)
+    total_value = perp_value + spot_usdc
+
     lines = [
         f"{BOLD}=== HL Account ==={RESET}",
-        f"Address:     {state.get('address', 'N/A')}",
-        f"Value:       ${state.get('account_value', 0):.2f}",
-        f"Margin Used: ${state.get('total_margin', 0):.2f}",
-        f"Withdrawable: ${state.get('withdrawable', 0):.2f}",
+        f"Address:      {state.get('address', 'N/A')}",
+        f"Total Value:  ${total_value:.2f}",
+        f"  Perps:      ${perp_value:.2f}",
     ]
+    if spot_usdc:
+        lines.append(f"  Spot USDC:  ${spot_usdc:.2f}")
+    spot_balances = state.get("spot_balances", [])
+    for b in spot_balances:
+        if b["coin"] != "USDC" and float(b["total"]) != 0:
+            lines.append(f"  Spot {b['coin']:6s} {float(b['total']):.4f}")
+    lines.extend([
+        f"Margin Used:  ${state.get('total_margin', 0):.2f}",
+        f"Withdrawable: ${state.get('withdrawable', 0):.2f}",
+    ])
     return "\n".join(lines)
 
 

@@ -88,4 +88,24 @@ PULSE_PRESETS: Dict[str, PulseConfig] = {
         volume_surge_ratio=2.0,
         volume_min_24h=200_000.0,
     ),
+    # Tuned for 3-market yex testnet competition. v2 (2026-04-09): tighter
+    # signal thresholds than v1 — the v1 settings generated noise-driven
+    # signals that bled the cohort. Not safe for mainnet trading.
+    "competition": PulseConfig(
+        oi_delta_immediate_pct=5.0,    # v2: was 3.0 (default 15.0)
+        oi_delta_breakout_pct=3.0,     # v2: was 1.5 (default 8.0)
+        oi_baseline_window=3,          # was 6 — quicker baselines for short cohorts
+        volume_surge_ratio=1.8,        # v2: was 1.3 (default 3.0)
+        volume_surge_immediate=2.5,    # v2: was 2.0 (default 5.0)
+        volume_min_24h=50_000.0,       # was 500_000
+        funding_flip_threshold=0.0001, # was 0.0002
+        breakout_exceed_pct=0.6,       # v2: was 0.4 (default 1.5)
+        min_scans_for_signal=2,        # v2: was 1 (default 2) — require some history
+        contrib_explosion_oi_pct=5.0,  # v2: was 3.0 (default 15.0)
+        contrib_explosion_vol_mult=2.0, # v2: was 1.5 (default 5.0)
+        new_entry_deep_oi_pct=3.0,     # v2: was 1.5 (default 8.0)
+        new_entry_deep_max_vol_mult=2.0, # v2: was 3.0 (default 1.5)
+        deep_climber_min_windows=2,    # was 3
+        deep_climber_min_oi_pct=1.5,   # v2: was 1.0 (default 5.0)
+    ),
 }

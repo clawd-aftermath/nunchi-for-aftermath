@@ -32,3 +32,6 @@ node_modules/
 
 # Test / build artifacts
 .pytest_cache/
+
+# AI
+.claude

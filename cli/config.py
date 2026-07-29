@@ -90,19 +90,23 @@ class TradingConfig:
         return BuilderFeeConfig.from_env()
 
     def get_private_key(self) -> str:
-        # 1. Try encrypted keystore first
-        from cli.keystore import get_keystore_key
-        key = get_keystore_key()
-        if key:
-            return key
+        from common.credentials import resolve_private_key
+        try:
+            return resolve_private_key(venue="hl")
+        except RuntimeError:
+            from cli.web_auth import pairing_from_env
+            if pairing_from_env() is not None:
+                return ""
+            raise
 
-        # 2. Fall back to environment variable
-        key = os.environ.get("HL_PRIVATE_KEY", "")
+    def get_wallet_address(self, private_key: Optional[str] = None) -> str:
+        """Return the EVM signer address for the configured HL private key."""
+        from eth_account import Account
+
+        key = private_key or self.get_private_key()
         if not key:
-            raise RuntimeError(
-                "No private key available. Either:\n"
-                "  1. Import a key: hl wallet import\n"
-                "  2. Set HL_KEYSTORE_PASSWORD env var\n"
-                "  3. Set HL_PRIVATE_KEY env var"
-            )
-        return key
+            from cli.web_auth import require_pairing_from_env
+            return require_pairing_from_env().address
+        if not key.startswith("0x"):
+            key = "0x" + key
+        return Account.from_key(key).address

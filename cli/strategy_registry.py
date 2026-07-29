@@ -21,8 +21,18 @@ STRATEGY_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "hedge_agent": {
         "path": "strategies.hedge_agent:HedgeAgent",
-        "description": "Reduces excess exposure per deterministic mandate",
+        "description": "inventory reducer (delta control), not the BTCSWP funding-rate hedge",
         "params": {"notional_threshold": 15000.0},
+    },
+    "cfi_hedge": {
+        "path": "strategies.cfi_hedge_agent:CfiHedgeAgent",
+        "description": "CFI-v2 funding-cost hedge",
+        "params": {
+            "notional_trigger": 100000.0,
+            "max_hedge_notional": 50000.0,
+            "max_per_day": 5,
+            "min_interval_seconds": 300,
+        },
     },
     "rfq_agent": {
         "path": "strategies.rfq_agent:RFQAgent",
@@ -36,7 +46,7 @@ STRATEGY_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "claude_agent": {
         "path": "strategies.claude_agent:ClaudeStrategy",
-        "description": "LLM trading agent — Gemini (default) or Claude",
+        "description": "LLM trading agent — Gemini (default), Claude, OpenAI, or ClawRouter (x402 USDC)",
         "params": {"model": "gemini-2.0-flash", "base_size": 0.5},
     },
     "engine_mm": {
@@ -73,6 +83,26 @@ STRATEGY_REGISTRY: Dict[str, Dict[str, Any]] = {
         "path": "strategies.basis_arb:BasisArbStrategy",
         "description": "Basis arbitrage — trades implied basis from funding rate",
         "params": {"basis_threshold_bps": 5.0, "size": 1.0},
+    },
+    "simplified_ensemble": {
+        "path": "strategies.simplified_ensemble:SimplifiedEnsembleStrategy",
+        "description": "6-signal ensemble (4/6 vote) — ported from auto-research exp52 (score 13.5)",
+        "params": {"size": 1.0},
+    },
+    "funding_momentum": {
+        "path": "strategies.funding_momentum:FundingMomentumStrategy",
+        "description": "Funding rate mean-reversion — trade extreme funding z-scores with EMA confirmation",
+        "params": {"size": 1.0},
+    },
+    "oi_divergence": {
+        "path": "strategies.oi_divergence:OIDivergenceStrategy",
+        "description": "OI divergence filter — enter on price/OI agreement, exit on divergence",
+        "params": {"size": 1.0},
+    },
+    "trend_follower": {
+        "path": "strategies.trend_follower:TrendFollowerStrategy",
+        "description": "EMA crossover + ADX trend strength filter — avoid chop, catch sustained moves",
+        "params": {"size": 1.0},
     },
 }
 

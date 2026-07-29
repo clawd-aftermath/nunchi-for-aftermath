@@ -74,6 +74,18 @@ def _load_env_password() -> str:
     return ""
 
 
+def _resolve_password(password: Optional[str] = None) -> str:
+    """Resolve keystore password from argument, env var, or env file."""
+    import os
+
+    if password:
+        return password
+    password = os.environ.get("HL_KEYSTORE_PASSWORD", "")
+    if password:
+        return password
+    return _load_env_password()
+
+
 def get_keystore_key(address: Optional[str] = None, password: Optional[str] = None) -> Optional[str]:
     """Try to load a private key from keystore.
 
@@ -81,16 +93,11 @@ def get_keystore_key(address: Optional[str] = None, password: Optional[str] = No
     If password is None, checks HL_KEYSTORE_PASSWORD env var.
     Returns None if no keystore available or password not provided.
     """
-    import os
-
     keystores = list_keystores()
     if not keystores:
         return None
 
-    password = password or os.environ.get("HL_KEYSTORE_PASSWORD", "")
-    if not password:
-        # Auto-detect from ~/.hl-agent/env
-        password = _load_env_password()
+    password = _resolve_password(password)
     if not password:
         return None
 
@@ -101,5 +108,25 @@ def get_keystore_key(address: Optional[str] = None, password: Optional[str] = No
 
     try:
         return load_keystore(address, password)
+    except Exception:
+        return None
+
+
+def get_keystore_key_for_address(address: str, password: Optional[str] = None) -> Optional[str]:
+    """Load private key for a specific wallet address.
+
+    Used by multi-wallet mode to get keys for per-strategy wallets.
+    Returns None if address not found or password unavailable.
+    """
+    if not address:
+        return None
+
+    password = _resolve_password(password)
+    if not password:
+        return None
+
+    addr = address.lower().replace("0x", "")
+    try:
+        return load_keystore(addr, password)
     except Exception:
         return None

@@ -1,6 +1,7 @@
 """hl apex — APEX autonomous strategy commands."""
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ def apex_run(
     preset: Optional[str] = typer.Option(None, "--preset", "-p"),
     config: Optional[Path] = typer.Option(None, "--config", "-c"),
     mock: bool = typer.Option(False, "--mock"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Simulate orders without real HL connection (alias for --mock)"),
     resume: bool = typer.Option(True, "--resume/--fresh", help="Resume from saved state or start fresh"),
     mainnet: bool = typer.Option(False, "--mainnet"),
     json_output: bool = typer.Option(False, "--json"),
@@ -24,13 +26,26 @@ def apex_run(
     budget: float = typer.Option(0, "--budget", help="Override total budget ($)"),
     slots: int = typer.Option(0, "--slots", help="Override max slots"),
     leverage: float = typer.Option(0, "--leverage", help="Override leverage"),
+    markets: Optional[str] = typer.Option(
+        None, "--markets", "-m",
+        help="Comma-separated list of allowed instruments (e.g. VXX-USDYP,US3M-USDYP). "
+             "Restricts pulse/radar scans and entries to only these markets. "
+             "Required when running in PR-3 dedicated-wallet mode where the agent "
+             "is funded on a HIP-3 dex (e.g. yex) and should not scan universal HL perps.",
+    ),
     data_dir: str = typer.Option("data/apex", "--data-dir"),
+    strategy_names: Optional[str] = typer.Option(
+        None, "--strategy-names",
+        help="Comma-separated strategy names to run (e.g. regime_mm,funding_momentum). "
+             "Overrides MARKET_STRATEGY_MAP auto-routing.",
+    ),
 ):
     """Start APEX autonomous multi-slot strategy."""
-    _run_apex(tick=tick, preset=preset, config=config, mock=mock,
+    _run_apex(tick=tick, preset=preset, config=config, mock=mock or dry_run,
               resume=resume, mainnet=mainnet, json_output=json_output,
               max_ticks=max_ticks, budget=budget, slots=slots,
-              leverage=leverage, data_dir=data_dir)
+              leverage=leverage, markets=markets, data_dir=data_dir,
+              strategy_names=strategy_names)
 
 
 @apex_app.command("once")
@@ -49,23 +64,63 @@ def apex_once(
 
 
 @apex_app.command("status")
-def apex_status(data_dir: str = typer.Option("data/apex", "--data-dir")):
+def apex_status(
+    data_dir: str = typer.Option("data/apex", "--data-dir"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable status JSON"),
+):
     """Show current APEX state and positions."""
     project_root = str(Path(__file__).resolve().parent.parent.parent)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
     from modules.apex_state import ApexStateStore
-    import time as _time
 
     store = ApexStateStore(path=f"{data_dir}/state.json")
     state = store.load()
 
     if not state:
+        if json_output:
+            typer.echo(json.dumps({"found": False, "data_dir": data_dir, "slots": [],
+                                   "positions": []}))
+            raise typer.Exit()
         typer.echo("No APEX state found. Run 'hl apex run' first.")
         raise typer.Exit()
 
     active = state.active_slots()
+
+    if json_output:
+        positions = [
+            {
+                "slot_id": s.slot_id,
+                "instrument": s.instrument,
+                "direction": s.direction,
+                "entry_price": s.entry_price,
+                "entry_size": s.entry_size,
+                "current_price": s.current_price,
+                "current_roe": s.current_roe,
+                "high_water_roe": s.high_water_roe,
+                "entry_source": s.entry_source,
+                "margin_allocated": s.margin_allocated,
+            }
+            for s in active
+        ]
+        payload = {
+            "found": True,
+            "data_dir": data_dir,
+            "run_state": "active" if active else "idle",
+            "tick_count": state.tick_count,
+            "max_slots": len(state.slots),
+            "active_slots": len(active),
+            "total_trades": state.total_trades,
+            "daily_pnl": state.daily_pnl,
+            "total_pnl": state.total_pnl,
+            "daily_loss_triggered": state.daily_loss_triggered,
+            "slots": [s.to_dict() for s in state.slots],
+            "positions": positions,
+        }
+        typer.echo(json.dumps(payload, indent=2, default=str))
+        raise typer.Exit()
+
     typer.echo(f"Ticks: {state.tick_count}  |  Active: {len(active)}/{len(state.slots)}  |  "
                f"Trades: {state.total_trades}")
     typer.echo(f"Daily PnL: ${state.daily_pnl:+.2f}  |  Total PnL: ${state.total_pnl:+.2f}")
@@ -81,6 +136,101 @@ def apex_status(data_dir: str = typer.Option("data/apex", "--data-dir")):
                        f"{s.current_roe:+.1f}%{'':>2} {s.entry_source:<16}")
     else:
         typer.echo("\nNo active positions.")
+
+
+@apex_app.command("proof")
+def apex_proof(
+    data_dir: str = typer.Option("data/apex", "--data-dir"),
+    json_output: bool = typer.Option(True, "--json/--no-json",
+                                     help="Emit the proof artifact as JSON to stdout"),
+):
+    """Run the APEX decision pipeline on a fixed fixture — NO live orders.
+
+    Drives the pure ApexEngine over a deterministic state/signal fixture so the
+    output is byte-stable. No venue adapter is constructed, so no order can be
+    placed. Writes the proof artifact to <data_dir>/proof/apex-proof.json and a
+    summary line to <data_dir>/events.jsonl.
+    """
+    project_root = str(Path(__file__).resolve().parent.parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    from modules.apex_config import ApexConfig
+    from modules.apex_engine import ApexEngine
+    from modules.apex_state import ApexState
+    from modules import proof_fixtures as fx
+    from cli.events import append_event
+
+    cfg = ApexConfig()
+    cfg.margin_per_slot = cfg.total_budget / max(cfg.max_slots, 1)
+    state = ApexState.from_dict(fx.apex_proof_state())
+    engine = ApexEngine(cfg)
+
+    actions = engine.evaluate(
+        state=state,
+        pulse_signals=fx.apex_proof_pulse_signals(),
+        radar_opps=fx.apex_proof_radar_opps(),
+        slot_prices=fx.apex_proof_slot_prices(),
+        slot_guard_results={},
+        now_ms=fx.PROOF_NOW_MS,
+    )
+
+    action_dicts = [
+        {
+            "action": a.action,
+            "slot_id": a.slot_id,
+            "instrument": a.instrument,
+            "direction": a.direction,
+            "source": a.source,
+            "signal_score": a.signal_score,
+            "execution_algo": a.execution_algo,
+            "reason": a.reason,
+        }
+        for a in actions
+    ]
+
+    artifact = {
+        "proof": "apex",
+        "deterministic": True,
+        "live_orders": False,
+        "now_ms": fx.PROOF_NOW_MS,
+        "config": {
+            "max_slots": cfg.max_slots,
+            "leverage": cfg.leverage,
+            "margin_per_slot": cfg.margin_per_slot,
+            "radar_score_threshold": cfg.radar_score_threshold,
+            "max_negative_roe": cfg.max_negative_roe,
+        },
+        "input_summary": {
+            "active_slots": len(state.active_slots()),
+            "pulse_signals": len(fx.apex_proof_pulse_signals()),
+            "radar_opps": len(fx.apex_proof_radar_opps()),
+        },
+        "action_count": len(action_dicts),
+        "actions": action_dicts,
+    }
+
+    proof_dir = Path(data_dir) / "proof"
+    proof_dir.mkdir(parents=True, exist_ok=True)
+    proof_file = proof_dir / "apex-proof.json"
+    proof_file.write_text(json.dumps(artifact, indent=2, sort_keys=True))
+
+    append_event(data_dir, {
+        "type": "apex_proof",
+        "action_count": len(action_dicts),
+        "actions": [a["action"] for a in action_dicts],
+        "live_orders": False,
+        "artifact": str(proof_file),
+    })
+
+    if json_output:
+        typer.echo(json.dumps(artifact, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"APEX proof OK — {len(action_dicts)} action(s), no live orders.")
+        for a in action_dicts:
+            typer.echo(f"  {a['action']:<6} slot={a['slot_id']} {a['instrument']:<10} "
+                       f"{a['direction']:<5} :: {a['reason']}")
+        typer.echo(f"Artifact: {proof_file}")
 
 
 @apex_app.command("reconcile")
@@ -178,7 +328,7 @@ def apex_presets():
 
 def _run_apex(tick, preset, config, mock, mainnet, json_output,
               max_ticks, budget, slots, leverage, data_dir, single=False,
-              resume=True):
+              resume=True, markets=None, strategy_names=None):
     project_root = str(Path(__file__).resolve().parent.parent.parent)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
@@ -192,6 +342,11 @@ def _run_apex(tick, preset, config, mock, mainnet, json_output,
     else:
         cfg = ApexConfig()
 
+    # Stamp the preset name onto the config so the runner can use it to load
+    # matching pulse/radar sub-guard presets at boot.
+    if preset:
+        cfg.preset_name = preset
+
     # CLI overrides
     if budget > 0:
         cfg.total_budget = budget
@@ -201,12 +356,23 @@ def _run_apex(tick, preset, config, mock, mainnet, json_output,
         cfg.margin_per_slot = cfg.total_budget / max(slots, 1)
     if leverage > 0:
         cfg.leverage = leverage
+    if markets:
+        cfg.allowed_instruments = [m.strip() for m in markets.split(",") if m.strip()]
+    if strategy_names:
+        cfg.strategy_enabled = True
+        cfg.strategy_names = [s.strip() for s in strategy_names.split(",") if s.strip()]
 
-    logging.basicConfig(
+    from common.logging_config import configure_logging, log_startup_banner, resolve_obsidian_path
+
+    configure_logging(
+        strategy_name=preset or "apex",
+        log_dir=str(Path(data_dir).parent / "logs") if data_dir != "data/apex" else "logs",
+        json_logs=json_output,
         level=logging.INFO,
-        format="%(asctime)s %(name)-14s %(levelname)-5s %(message)s",
-        datefmt="%H:%M:%S",
     )
+
+    # Auto-detect Obsidian vault if not explicitly configured
+    cfg.obsidian_vault_path = resolve_obsidian_path(cfg.obsidian_vault_path)
 
     if mock:
         from cli.hl_adapter import DirectMockProxy
@@ -237,11 +403,87 @@ def _run_apex(tick, preset, config, mock, mainnet, json_output,
     if _builder_info:
         typer.echo(f"Builder fee: {_bcfg.fee_bps} bps -> {_bcfg.builder_address[:10]}...")
 
+    # Multi-wallet mode: if wallet_config is non-empty, use MultiWalletEngine
+    if cfg.wallet_config and not single:
+        from cli.multi_wallet_engine import MultiWalletEngine
+        from modules.wallet_manager import WalletConfig, WalletManager
+
+        wm = WalletManager.from_yaml_section(cfg.wallet_config)
+        typer.echo(f"Multi-wallet mode: {len(wm.wallet_ids)} wallets")
+
+        def _adapter_factory(wc: WalletConfig):
+            """Create a VenueAdapter per wallet.  In mock mode every wallet
+            shares the mock backend; in live mode each gets its own proxy."""
+            if mock:
+                from adapters.mock_adapter import MockVenueAdapter
+                return MockVenueAdapter()
+            else:
+                # Live mode: all wallets share the same HL connection for now
+                from adapters.hl_adapter import HLVenueAdapter
+                return HLVenueAdapter(hl)  # type: ignore[arg-type]
+
+        def _strategy_factory(wc: WalletConfig):
+            """Create a per-wallet strategy instance.  Reuses the APEX engine
+            strategy via a lightweight TradingEngine adapter — each wallet
+            gets its own strategy_id scoped to the wallet."""
+            from sdk.strategy_sdk.base import BaseStrategy, StrategyContext
+            from common.models import MarketSnapshot, StrategyDecision
+
+            class WalletPassthroughStrategy(BaseStrategy):
+                """Thin wrapper that tags strategy_id with wallet name."""
+                def __init__(self, wallet_id: str):
+                    super().__init__(strategy_id=f"apex_{wallet_id}")
+                def on_tick(self, snapshot, context=None):
+                    return []  # Decisions come from ApexRunner at higher level
+
+            return WalletPassthroughStrategy(wc.wallet_id)
+
+        mwe = MultiWalletEngine(
+            wallet_manager=wm,
+            adapter_factory=_adapter_factory,
+            strategy_factory=_strategy_factory,
+            instrument="ETH-PERP",
+            tick_interval=tick,
+            dry_run=mock,
+            data_dir=data_dir,
+            builder=_builder_info,
+            max_house_drawdown=cfg.daily_loss_limit * len(wm.wallet_ids),
+            max_house_exposure=cfg.total_budget * cfg.leverage * len(wm.wallet_ids),
+        )
+
+        log_startup_banner(
+            strategy_name=preset or "apex",
+            mode="MOCK" if mock else f"LIVE ({'mainnet' if mainnet else 'testnet'})",
+            budget=cfg.total_budget,
+            slots=cfg.max_slots,
+            leverage=cfg.leverage,
+            daily_loss_limit=cfg.daily_loss_limit,
+            guard_preset=cfg.guard_preset,
+            obsidian_enabled=bool(cfg.obsidian_vault_path),
+            reflect_interval=cfg.reflect_interval_ticks,
+        )
+
+        mwe.run(max_ticks=max_ticks, resume=resume)
+        return
+
+    # Single-wallet mode (default): use ApexRunner
     from skills.apex.scripts.standalone_runner import ApexRunner
 
     runner = ApexRunner(hl=hl, config=cfg, tick_interval=tick,
                         json_output=json_output, data_dir=data_dir,
                         builder=_builder_info, resume=resume)
+
+    log_startup_banner(
+        strategy_name=preset or "apex",
+        mode="MOCK" if mock else f"LIVE ({'mainnet' if mainnet else 'testnet'})",
+        budget=cfg.total_budget,
+        slots=cfg.max_slots,
+        leverage=cfg.leverage,
+        daily_loss_limit=cfg.daily_loss_limit,
+        guard_preset=cfg.guard_preset,
+        obsidian_enabled=bool(cfg.obsidian_vault_path),
+        reflect_interval=cfg.reflect_interval_ticks,
+    )
 
     if single:
         runner.run_once()

@@ -21,12 +21,12 @@
   <img src="https://img.shields.io/badge/strategies-14-C9A84C" alt="Strategies" />
   <img src="https://img.shields.io/badge/tests-483%20passing-brightgreen" alt="Tests" />
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License" />
-  <img src="https://img.shields.io/badge/MCP-16%20tools-8A2BE2" alt="MCP" />
+  <img src="https://img.shields.io/badge/MCP-24%20tools-8A2BE2" alt="MCP" />
 </p>
 
 <p align="center">
-  <a href="https://railway.com/new/template?template=https://github.com/Nunchi-trade/agent-cli&envs=HL_PRIVATE_KEY,HL_TESTNET,RUN_MODE,APEX_PRESET&HL_TESTNETDefault=true&RUN_MODEDefault=apex&APEX_PRESETDefault=default">
-    <img src="https://railway.com/button.svg" alt="Deploy on Railway" height="36" />
+  <a href="https://auth.nunchi.trade">
+    <img src="https://img.shields.io/badge/Launch%20via-Nunchi%20Auth-C9A84C" alt="Launch via Nunchi Auth" height="36" />
   </a>
 </p>
 
@@ -74,6 +74,21 @@ hl builder approve --mainnet
 hl run engine_mm -i ETH-PERP --tick 10 --mainnet
 hl apex run --mainnet
 ```
+
+### Funding Hedge
+
+Propose a read-only BTCSWP funding-rate hedge from the CLI or any MCP client. The default `hl hedge propose` path reads the current account position; passing `--perp-notional` switches to pure sizing mode with no account fetch or order execution.
+
+```bash
+hl hedge info --json
+hl hedge propose --asset BTC --side long --perp-notional 150000 --funding-apr 42
+hl hedge propose --asset BTC --side long --perp-notional 150000 --funding-rate-8h 0.0003 --json
+hl hedge backtest --csv funding.csv --asset BTC --side long --perp-notional 150000
+```
+
+Backtest CSVs need a `funding_rate_8h`, `perp_funding_rate_8h`, `funding_rate`, or `rate` column. Add `hedge_rate_8h`, `btcswp_rate_8h`, or `btcswp_funding_rate_8h` when you have realized BTCSWP rates; otherwise the backtest uses an idealized offset.
+
+MCP tools: `funding_hedge_info`, `funding_hedge_propose`, `funding_hedge_backtest`
 
 ---
 
@@ -241,7 +256,7 @@ Supporting strategies for portfolio management, block liquidity, and autonomous 
 
 | Strategy | Description | Key Parameters | When to Use |
 |----------|-------------|----------------|-------------|
-| `hedge_agent` | Reduces excess exposure per deterministic mandate. Fires when net notional exceeds threshold. | `notional_threshold` | Always-on risk overlay. Pairs with any MM or signal strategy. |
+| `hedge_agent` | Inventory exposure reducer. Fires when net notional exceeds threshold. This is not the BTCSWP funding-rate hedge; use `hl hedge propose` / `hl hedge backtest` for that. | `notional_threshold` | Always-on risk overlay. Pairs with any MM or signal strategy. |
 | `rfq_agent` | Block-size dark RFQ liquidity — quotes for large orders with wider spreads. | `min_size`, `spread_bps` | Institutional/block flow. Provides hidden liquidity for large counterparties. |
 | `claude_agent` | Multi-model LLM trading agent. Sends market snapshot to an LLM (Gemini, Claude, or OpenAI), receives structured trade decisions. | `model`, `base_size` | Experimental/research. Autonomous decision-making using LLM reasoning. |
 
@@ -582,6 +597,9 @@ hl radar run [options]            # Opportunity radar
 hl pulse run [options]            # Pulse momentum detector
 hl guard run -i ETH-PERP [options] # Guard trailing stop
 hl reflect run [--since DATE]        # Performance review
+hl hedge info [--json]             # Funding hedge profiles and schemas
+hl hedge propose [options]         # BTCSWP funding hedge proposal
+hl hedge backtest --csv <path>     # Local funding hedge cashflow backtest
 
 # Infrastructure
 hl builder approve [--mainnet]    # Approve builder fee
@@ -598,76 +616,81 @@ hl mcp serve                      # Start MCP server
 
 Expose all trading tools via [Model Context Protocol](https://modelcontextprotocol.io) for AI agent integration.
 
+### Hosted MCP (Recommended)
+
+Use the hosted Nunchi MCP when you want a Robinhood-style setup: paste one URL into your AI client, authenticate, and grant scoped tool access. Your AI client receives a scoped MCP token, not your exchange private key.
+
+```bash
+https://agent.nunchi.trade/mcp/trading
+```
+
+Client setup:
+
+```bash
+# Cursor
+Settings -> Cursor Settings -> Tools & MCPs -> Connect
+MCP URL: https://agent.nunchi.trade/mcp/trading
+
+# Claude Code
+claude mcp add nunchi-trading --transport http https://agent.nunchi.trade/mcp/trading
+
+# Codex CLI
+codex mcp add nunchi-trading --url https://agent.nunchi.trade/mcp/trading
+```
+
+After connecting, authenticate in the browser consent flow and start with:
+
+```text
+Run setup_check, then show my account status and available strategies.
+```
+
+Hosted access defaults to read-only/testnet. Write tools (`trade`, `run_strategy`, `apex_run`) and mainnet access require explicit consent and gateway-enforced limits.
+
+### Local MCP (Development Only)
+
 ```bash
 hl mcp serve                      # stdio transport (default)
 hl mcp serve --transport sse      # SSE transport
 ```
 
-**16 tools exposed:** `account`, `status`, `trade`, `run_strategy`, `strategies`, `radar_run`, `apex_status`, `apex_run`, `reflect_run`, `setup_check`, `builder_status`, `wallet_list`, `wallet_auto`, `agent_memory`, `trade_journal`, `judge_report`
+**24 tools exposed:** `strategies`, `builder_status`, `wallet_list`, `wallet_auto`, `setup_check`, `funding_hedge_info`, `funding_hedge_propose`, `funding_hedge_backtest`, `account`, `status`, `trade`, `run_strategy`, `radar_run`, `apex_status`, `apex_run`, `reflect_run`, `schedule_cancel`, `emergency_close_all`, `order_status`, `funding_rates`, `agent_memory`, `trade_journal`, `judge_report`, `obsidian_context`
 
-Fast tools (strategies, builder, wallet, setup, memory, journal, judge) call Python directly — zero subprocess overhead.
+Fast tools (strategies, builder, wallet, setup, memory, journal, judge) call Python directly — zero subprocess overhead. Local MCP is for development and agent harness testing only; hosted deployment goes through Nunchi Auth and the subscription-gated hosted-agent flow.
 
 ### HTTP API & SSE
 
 Every deployed agent also exposes an HTTP REST API and SSE real-time feed for dashboards, monitoring, and external integrations. A separate leaderboard microservice tracks agent PnL rankings.
 
-**[Full API Reference →](docs/api-reference.md)**
+**[Full API Reference →](docs/api-reference.md)**  
+**[July 2026 Exhibit A Testing Plan →](docs/EXHIBIT_A_TESTING_PLAN.md)**
 
 ---
 
-## Deploy on Railway
+## Hosted Agent Deployment
 
-Two deployment options: **headless** (APEX runs strategies directly) or **OpenClaw agent** (conversational AI trading assistant with Telegram).
+The only supported hosted deployment path is **Nunchi-hosted**: users pay in web-auth, bind an agent wallet, and Nunchi provisions and manages the agent on Nunchi-owned Railway infrastructure.
 
-### Option A: Headless APEX (Deterministic)
+Start here:
 
-One-click deploy to run APEX autonomously. No AI model needed — pure deterministic strategy execution.
+[Launch a hosted agent through Nunchi Auth](https://auth.nunchi.trade)
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/Nunchi-trade/agent-cli&envs=HL_PRIVATE_KEY,HL_TESTNET,RUN_MODE,APEX_PRESET&HL_TESTNETDefault=true&RUN_MODEDefault=apex&APEX_PRESETDefault=default)
+User flow:
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `HL_PRIVATE_KEY` | Yes | — | Your Hyperliquid private key |
-| `HL_TESTNET` | No | `true` | `true` for testnet, `false` for mainnet |
-| `RUN_MODE` | No | `apex` | `apex`, `wolf` (alias), `strategy`, or `mcp` |
-| `APEX_PRESET` | No | `default` | `conservative`, `default`, or `aggressive` |
+1. Open web-auth and connect a wallet.
+2. Bind or create an agent wallet.
+3. Pay for the hosted-agent subscription with Stripe-supported payment methods or USDC.
+4. Deploy the hosted agent from the wallet binding page.
+5. Refresh status and open the hosted endpoint returned by web-auth.
 
-**Run modes:**
-- **apex** (default) — APEX multi-slot orchestrator with autonomous entry, exit, Guard trailing stops, and REFLECT self-improvement loop
-- **strategy** — Single strategy loop (set `STRATEGY=engine_mm`, `avellaneda_mm`, etc.)
-- **mcp** — MCP server for AI agent integration (SSE transport)
+Hosted agents use Nunchi-owned inference credentials by default:
 
-### Option B: OpenClaw Agent (Conversational AI)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AI_PROVIDER` | `openrouter` | OpenAI-compatible hosted inference |
+| `AI_MODEL` | `openrouter/auto` | Low-latency/cost-aware default for chat and tool use |
+| `NUNCHI_REFLECT_MODEL` | `openrouter/fusion` | Higher-confidence model for REFLECT/research-style analysis |
 
-One-click deploy of a full OpenClaw agent that uses our CLI as the tool backend. Talk to your trading bot via Telegram — it scans markets, enters trades, manages risk, and learns from its mistakes.
-
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/Nunchi-trade/agent-cli/tree/main/deploy/openclaw-railway&envs=HL_PRIVATE_KEY,AI_PROVIDER,AI_API_KEY,TELEGRAM_BOT_TOKEN,TELEGRAM_USERNAME,HL_TESTNET&HL_TESTNETDefault=true)
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `HL_PRIVATE_KEY` | Yes | — | Your Hyperliquid private key |
-| `AI_PROVIDER` | Yes | — | `anthropic`, `openai`, `gemini`, or `openrouter` |
-| `AI_API_KEY` | Yes | — | API key for the chosen AI provider |
-| `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram bot token (from @BotFather) |
-| `TELEGRAM_USERNAME` | Yes | — | Your Telegram @username |
-| `HL_TESTNET` | No | `true` | `true` for testnet, `false` for mainnet |
-
-**What you get:**
-- OpenClaw gateway with web UI at `/openclaw`
-- Telegram integration — chat with your bot to start/stop trading, run scans, check status
-- Our 13 MCP trading tools as the agent's primary capabilities
-- Persistent state across redeploys via `/data` volume
-- Auto-onboard: bot sends "Agent ready" to Telegram on first deploy
-- REFLECT self-improvement: the agent analyzes its own trades and adjusts strategy parameters
-
-**How it works:**
-1. Deploy sets up OpenClaw + our `hl mcp serve` as the tool provider
-2. Bot auto-configures Telegram and sends you a ready message
-3. Tell it "start trading" → it runs APEX with autonomous entry, exit, and risk management
-4. Ask "how did we do?" → it runs REFLECT and reports performance metrics
-5. The agent reads workspace files (AGENTS.md, SOUL.md) that define its trading behavior
-
-Both options persist state via Railway volume at `/data` — APEX state, REFLECT reports, Radar history, and agent memory survive redeploys.
+Users do not need Railway credentials, Railway project access, or provider API keys. Billing, entitlement checks, wallet binding, secret injection, lifecycle controls, and hosted endpoint discovery all live in web-auth. This repository intentionally does not include Dockerfiles, `railway.toml`, or public deployment templates.
 
 ---
 
@@ -694,7 +717,7 @@ hl run engine_mm -i BTCSWP-USDYP --tick 10
 ```
 cli/           CLI commands and trading engine
   commands/    Subcommand modules (run, apex, radar, pulse, guard, reflect, house, ...)
-  mcp_server.py  MCP server (16 tools via FastMCP)
+  mcp_server.py  MCP server (24 tools via FastMCP)
   hl_adapter.py  Direct HL API adapter (live + mock)
   builder_fee.py Builder fee config (HL native BuilderInfo)
   keystore.py    Encrypted keystore (geth-compatible)

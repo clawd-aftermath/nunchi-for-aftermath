@@ -101,6 +101,8 @@ class RiskState:
     risk_gate: RiskGate = RiskGate.OPEN
     consecutive_losses: int = 0
     cooldown_entered_ts: int = 0
+    # Per-wallet blocked state (wallet_id → reason)
+    blocked_wallets: Dict[str, str] = field(default_factory=dict)
     # Price history for circuit breaker detection
     price_history: Dict[str, List[Tuple[int, str]]] = field(default_factory=dict)
 
@@ -117,6 +119,7 @@ class RiskState:
             "risk_gate": self.risk_gate.value,
             "consecutive_losses": self.consecutive_losses,
             "cooldown_entered_ts": self.cooldown_entered_ts,
+            "blocked_wallets": self.blocked_wallets,
         }
 
     @classmethod
@@ -135,6 +138,7 @@ class RiskState:
             risk_gate=risk_gate,
             consecutive_losses=data.get("consecutive_losses", 0),
             cooldown_entered_ts=data.get("cooldown_entered_ts", 0),
+            blocked_wallets=data.get("blocked_wallets", {}),
         )
 
 
@@ -398,6 +402,37 @@ class RiskManager:
                 self.state.safe_mode_reason = ""
                 self.state.rounds_in_safe_mode = 0
             self.state.reduce_only = False
+            self.clear_wallet_blocks()
+
+    # ── Per-Wallet Risk ──────────────────────────────────────────────
+
+    def check_wallet_daily_loss(self, wallet_id: str, wallet_pnl: float,
+                                wallet_limit: float) -> bool:
+        """Check if a specific wallet has breached its daily loss limit.
+
+        Returns True if the wallet should stop trading (loss >= limit).
+        Persists block in state.blocked_wallets for observability.
+        Does NOT change the house-level gate — that's separate.
+        """
+        if wallet_limit <= 0:
+            # Unblock if previously blocked (limit changed)
+            self.state.blocked_wallets.pop(wallet_id, None)
+            return False
+        if wallet_pnl <= -wallet_limit:
+            if wallet_id not in self.state.blocked_wallets:
+                log.warning("Wallet %s daily loss %.2f >= limit %.2f — blocking entries",
+                            wallet_id, abs(wallet_pnl), wallet_limit)
+            self.state.blocked_wallets[wallet_id] = f"daily_loss_{abs(wallet_pnl):.0f}"
+            return True
+        # Clear block if PnL recovered
+        self.state.blocked_wallets.pop(wallet_id, None)
+        return False
+
+    def clear_wallet_blocks(self) -> None:
+        """Clear all per-wallet blocks (called at daily reset)."""
+        if self.state.blocked_wallets:
+            log.info("Cleared %d wallet blocks", len(self.state.blocked_wallets))
+        self.state.blocked_wallets.clear()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
