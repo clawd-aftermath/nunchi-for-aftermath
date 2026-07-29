@@ -6,16 +6,41 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from common.models import MarketSnapshot
+from common.models import HIP3_DEXS, MarketSnapshot, instrument_to_coin
 
 log = logging.getLogger("hl_proxy")
 
 ZERO = Decimal("0")
+
+
+def _retry_on_429(fn, *args, max_retries: int = 3, base_delay: float = 2.0, **kwargs):
+    """Call fn with exponential backoff on 429 rate-limit errors.
+
+    The HL SDK raises ClientError(429) when CloudFront throttles us.
+    Without retry, a single 429 crashes the entire agent process —
+    14 agents starting simultaneously guarantees some hit the limit.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            status = getattr(e, "status_code", None) or (e.args[0] if e.args and isinstance(e.args[0], int) else 0)
+            if status == 429 and attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                log.warning("HL 429 rate limit (attempt %d/%d), retrying in %.1fs",
+                            attempt + 1, max_retries, delay)
+                time.sleep(delay)
+                continue
+            raise
+
+from parent.sdk_patches import patch_spot_meta_indexing as _patch_spot_meta_indexing
 
 
 @dataclass
@@ -212,6 +237,14 @@ class MockHLProxy:
             "MKR": "1500.0", "SNX": "3.0", "COMP": "50.0",
         }
 
+    def get_dex_markets(self, dex: str) -> list:
+        """Return empty HIP-3 DEX markets for mock."""
+        return [{"universe": []}, []]
+
+    def get_dex_mids(self, dex: str) -> Dict[str, str]:
+        """Return empty HIP-3 DEX mids for mock."""
+        return {}
+
     def get_fills(self, since_ms: int = 0) -> List[HLFill]:
         """Get fills since a given timestamp."""
         return [f for f in self.fills if f.timestamp_ms >= since_ms]
@@ -224,15 +257,30 @@ class HLProxy:
     Use TradingConfig.get_private_key() to resolve credentials.
     """
 
-    def __init__(self, private_key: Optional[str] = None, testnet: bool = True):
-        import os
-        self.private_key = private_key or os.environ.get("HL_PRIVATE_KEY", "")
+    def __init__(self, private_key: Optional[str] = None, testnet: bool = True,
+                 account_address: Optional[str] = None):
+        if private_key is None:
+            try:
+                from common.credentials import resolve_private_key
+                private_key = resolve_private_key(venue="hl")
+            except RuntimeError:
+                private_key = ""
+        self.private_key = private_key
         self.testnet = testnet
+        self._account_address = self._resolve_account_address(account_address)
         self._info = None
         self._exchange = None
         self._address = None
         self.placed_orders: List[Dict] = []
         self.fills: List[HLFill] = []
+
+    def _resolve_account_address(self, address: Optional[str] = None) -> str:
+        """Resolve delegated wallet from arg or HL_WALLET_ADDRESS env var."""
+        addr = address or os.environ.get("HL_WALLET_ADDRESS", "")
+        if addr and not re.fullmatch(r"0x[0-9a-fA-F]{40}", addr):
+            log.warning("HL_WALLET_ADDRESS invalid, ignoring: %s", addr)
+            return ""
+        return addr
 
     def _ensure_client(self):
         if self._info is not None:
@@ -242,13 +290,46 @@ class HLProxy:
         from hyperliquid.exchange import Exchange
         from hyperliquid.utils import constants
 
-        base_url = constants.TESTNET_API_URL if self.testnet else constants.MAINNET_API_URL
-        self._info = Info(base_url, skip_ws=True)
+        _patch_spot_meta_indexing()
 
-        account = Account.from_key(self.private_key)
-        self._address = account.address
-        self._exchange = Exchange(account, base_url)
-        log.info("HL client initialized: %s (testnet=%s)", self._address, self.testnet)
+        base_url = constants.TESTNET_API_URL if self.testnet else constants.MAINNET_API_URL
+        perp_dexs = [""] + list(HIP3_DEXS.keys())
+        # Info() constructor calls perp_dexs() which hits HL API —
+        # wrap with retry so startup 429s don't crash the agent.
+        self._info = _retry_on_429(
+            Info, base_url, skip_ws=True, timeout=10, perp_dexs=perp_dexs,
+        )
+
+        web_auth_wallet = None
+        if not self.private_key:
+            try:
+                from cli.web_auth import WebAuthWallet, install_hyperliquid_web_auth_signer, pairing_from_env
+                pairing = pairing_from_env()
+                if pairing is not None:
+                    install_hyperliquid_web_auth_signer()
+                    web_auth_wallet = WebAuthWallet(pairing)
+            except Exception as e:
+                log.warning("Failed to initialize web-auth wallet: %s", e)
+
+        account = web_auth_wallet or Account.from_key(self.private_key)
+        delegated = self._account_address
+        if delegated and delegated.lower() != account.address.lower():
+            self._address = delegated
+            self._exchange = Exchange(account, base_url, account_address=delegated, perp_dexs=perp_dexs)
+            log.info("HL client: agent=%s trading for %s (testnet=%s)",
+                     account.address, delegated, self.testnet)
+        else:
+            self._address = account.address
+            self._exchange = Exchange(account, base_url, perp_dexs=perp_dexs)
+            log.info("HL client initialized: %s (testnet=%s)", self._address, self.testnet)
+
+        # Enable HIP-3 DEX abstraction for agent trading
+        if HIP3_DEXS:
+            try:
+                self._exchange.agent_enable_dex_abstraction()
+                log.info("HIP-3 DEX abstraction enabled")
+            except Exception as e:
+                log.warning("Failed to enable HIP-3 DEX abstraction: %s", e)
 
     def set_leverage(self, leverage: int, coin: str = "ETH", is_cross: bool = True):
         """Set leverage for a coin. Call explicitly instead of hardcoding on init."""
@@ -261,15 +342,15 @@ class HLProxy:
 
     @staticmethod
     def _hl_coin(instrument: str) -> str:
-        """Convert internal instrument name to HL coin name (ETH-PERP → ETH)."""
-        return instrument.replace("-PERP", "").replace("-perp", "")
+        """Convert internal instrument name to HL coin name (ETH-PERP → ETH, VXX-USDYP → yex:VXX)."""
+        return instrument_to_coin(instrument)
 
     def get_snapshot(self, instrument: str = "ETH-PERP") -> MarketSnapshot:
         """Get real market data from HL."""
         self._ensure_client()
         try:
             coin = self._hl_coin(instrument)
-            book = self._info.l2_snapshot(coin)
+            book = _retry_on_429(self._info.l2_snapshot, coin)
             bids = book.get("levels", [[]])[0] if book.get("levels") else []
             asks = book.get("levels", [[], []])[1] if len(book.get("levels", [])) > 1 else []
 
@@ -286,8 +367,11 @@ class HLProxy:
                 spread_bps=round(spread, 2),
                 timestamp_ms=int(time.time() * 1000),
             )
+        except (ConnectionError, OSError, TimeoutError) as e:
+            log.error("HL snapshot network error for %s: %s", instrument, e)
+            return MarketSnapshot(instrument=instrument)
         except Exception as e:
-            log.error("Failed to get HL snapshot: %s", e)
+            log.error("HL snapshot unexpected error for %s: %s", instrument, e, exc_info=True)
             return MarketSnapshot(instrument=instrument)
 
     def place_orders_from_clearing(self, fills: List[Dict]) -> List[Dict]:
@@ -330,13 +414,18 @@ class HLProxy:
                 price = float(f["fill_price"])  # fallback to clearing price
 
             try:
+                from cli.builder_fee import BuilderFeeConfig
+
+                builder = BuilderFeeConfig.from_env().to_builder_info()
                 coin = self._hl_coin(inst)
+                order_kwargs = {"builder": builder} if builder else {}
                 result = self._exchange.order(
                     coin,
                     is_buy,
                     sz,
                     price,
                     {"limit": {"tif": "Ioc"}},
+                    **order_kwargs,
                 )
 
                 # Handle top-level error
@@ -379,9 +468,12 @@ class HLProxy:
 
                 placed.append(f)
                 self.placed_orders.append(f)
-            except Exception as e:
-                log.error("HL order failed: %s %s %s @ %s — %s",
+            except (ConnectionError, OSError, TimeoutError) as e:
+                log.error("HL order network error: %s %s %s @ %s — %s",
                           f["side"], sz, f["instrument"], price, e)
+            except Exception as e:
+                log.critical("HL order unexpected failure: %s %s %s @ %s — %s",
+                             f["side"], sz, f["instrument"], price, e, exc_info=True)
 
         log.info("Placed %d/%d orders on HL", len(placed),
                  sum(1 for f in fills if Decimal(str(f.get("quantity_filled", "0"))) > ZERO))
@@ -392,23 +484,33 @@ class HLProxy:
         self._ensure_client()
         end = int(time.time() * 1000)
         start = end - lookback_ms
-        return self._info.candles_snapshot(coin, interval, start, end)
+        return _retry_on_429(self._info.candles_snapshot, coin, interval, start, end)
 
     def get_meta_and_asset_ctxs(self) -> Any:
         """Fetch metadata and asset contexts for all perps."""
         self._ensure_client()
-        return self._info.meta_and_asset_ctxs()
+        return _retry_on_429(self._info.meta_and_asset_ctxs)
 
     def get_all_mids(self) -> Dict[str, str]:
         """Fetch mid prices for all assets."""
         self._ensure_client()
-        return self._info.all_mids()
+        return _retry_on_429(self._info.all_mids)
+
+    def get_dex_markets(self, dex: str) -> list:
+        """Fetch HIP-3 DEX metaAndAssetCtxs."""
+        self._ensure_client()
+        return _retry_on_429(self._info.post, "/info", {"type": "metaAndAssetCtxs", "dex": dex})
+
+    def get_dex_mids(self, dex: str) -> Dict[str, str]:
+        """Fetch HIP-3 DEX mid prices."""
+        self._ensure_client()
+        return _retry_on_429(self._info.post, "/info", {"type": "allMids", "dex": dex}) or {}
 
     def get_fills(self, since_ms: int = 0) -> List[HLFill]:
         """Get fills from HL user state."""
         if self._info and self._address:
             try:
-                user_fills = self._info.user_fills(self._address)
+                user_fills = _retry_on_429(self._info.user_fills, self._address)
                 for uf in user_fills:
                     ts = int(uf.get("time", 0))
                     if ts >= since_ms:
@@ -421,6 +523,8 @@ class HLProxy:
                             timestamp_ms=ts,
                             fee=Decimal(str(uf.get("fee", "0"))),
                         ))
+            except (ConnectionError, OSError, TimeoutError) as e:
+                log.error("Failed to fetch HL fills (network): %s", e)
             except Exception as e:
-                log.error("Failed to fetch HL fills: %s", e)
+                log.error("Failed to fetch HL fills: %s", e, exc_info=True)
         return [f for f in self.fills if f.timestamp_ms >= since_ms]

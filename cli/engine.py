@@ -6,10 +6,13 @@ import os
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-from common.models import MarketSnapshot
+from cli.hl_adapter import APICircuitBreakerOpen
+from common.models import MarketSnapshot, instrument_to_coin
+from common.venue_adapter import VenueAdapter
 from parent.position_tracker import Position, PositionTracker
 from parent.risk_manager import RiskLimits, RiskManager
 from parent.store import JSONLStore, StateDB
@@ -21,6 +24,8 @@ from execution.order_book import ManagedOrderBook
 
 log = logging.getLogger("engine")
 ZERO = Decimal("0")
+TICK_TIMEOUT_S = 30  # max seconds per tick before timeout
+MAX_CONSECUTIVE_TIMEOUTS = 3
 
 
 class TradingEngine:
@@ -28,7 +33,7 @@ class TradingEngine:
 
     def __init__(
         self,
-        hl,  # DirectHLProxy | DirectMockProxy
+        hl,  # VenueAdapter (or DirectHLProxy | DirectMockProxy for backwards compat)
         strategy: BaseStrategy,
         instrument: str = "ETH-PERP",
         tick_interval: float = 10.0,
@@ -57,6 +62,8 @@ class TradingEngine:
         self.tick_count = 0
         self.start_time_ms = 0
         self._running = False
+        self._consecutive_timeouts = 0
+        self._tick_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tick")
 
         # Optional Guard (composable mode — set via guard_config)
         self.guard_bridge = None   # type: ignore[assignment]
@@ -82,7 +89,7 @@ class TradingEngine:
 
         # Set leverage from risk config (not hardcoded)
         if not self.dry_run and hasattr(self.hl, 'set_leverage'):
-            coin = self.instrument.replace("-PERP", "").replace("-perp", "")
+            coin = instrument_to_coin(self.instrument)
             max_lev = int(self.risk_manager.limits.max_leverage)
             self.hl.set_leverage(max_lev, coin)
 
@@ -101,7 +108,21 @@ class TradingEngine:
                 break
 
             try:
-                self._tick()
+                future = self._tick_executor.submit(self._tick)
+                future.result(timeout=TICK_TIMEOUT_S)
+                self._consecutive_timeouts = 0
+            except FuturesTimeoutError:
+                self._consecutive_timeouts += 1
+                log.error("Tick %d timed out after %ds (%d/%d consecutive)",
+                          self.tick_count + 1, TICK_TIMEOUT_S,
+                          self._consecutive_timeouts, MAX_CONSECUTIVE_TIMEOUTS)
+                if self._consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                    log.critical("Engine entering safe mode: %d consecutive tick timeouts",
+                                 self._consecutive_timeouts)
+                    self.risk_manager.state.safe_mode = True
+            except APICircuitBreakerOpen as e:
+                log.critical("API circuit breaker open — entering safe mode: %s", e)
+                self.risk_manager.state.safe_mode = True
             except Exception as e:
                 log.error("Tick %d failed: %s", self.tick_count, e, exc_info=True)
 
@@ -122,6 +143,16 @@ class TradingEngine:
 
         # 2. Pre-tick risk check
         mark_prices = {self.instrument: Decimal(str(snapshot.mid_price))}
+
+        # 2a. Risk gate auto-expiry (check every tick, no-op if not in COOLDOWN)
+        self.risk_manager.check_auto_expiry()
+
+        # 2b. Risk gate — block all trading if CLOSED
+        if not self.risk_manager.can_trade():
+            log.warning("T%d: risk gate CLOSED — all trading halted", self.tick_count)
+            self._log_tick(snapshot, [], [], ok=False)
+            return
+
         ok, reason = self.risk_manager.pre_round_check(
             self.position_tracker, mark_prices
         )
@@ -178,6 +209,21 @@ class TradingEngine:
             if d.action == "place_order"
             and (d.side, d.size, d.limit_price) in valid_set
         ]
+
+        # 5b. Risk gate — in COOLDOWN, block new entries (exits still allowed)
+        if not self.risk_manager.can_open_position():
+            pos = self.position_tracker.get_agent_position(agent_id, self.instrument)
+            # Only allow reduce-size orders (exits)
+            pre_count = len(valid_decisions)
+            valid_decisions = [
+                d for d in valid_decisions
+                if (d.side == "sell" and pos.net_qty > ZERO)
+                or (d.side == "buy" and pos.net_qty < ZERO)
+            ]
+            blocked = pre_count - len(valid_decisions)
+            if blocked > 0:
+                log.warning("T%d: risk gate COOLDOWN — blocked %d new entries",
+                            self.tick_count, blocked)
 
         # 6. Execute orders
         fills = self.order_manager.update(valid_decisions, snapshot)
@@ -248,6 +294,26 @@ class TradingEngine:
         # 8. Post-fill risk update
         self.risk_manager.post_fill_update(self.position_tracker, mark_prices)
 
+        # 8b. Record win/loss for Risk Guardian gate machine
+        if fills:
+            pos_after = self.position_tracker.get_agent_position(agent_id, self.instrument)
+            # Position closed (went to zero) — determine win/loss from realized PnL
+            if pos_after.net_qty == ZERO and pos_after.realized_pnl != ZERO:
+                if pos_after.realized_pnl > ZERO:
+                    self.risk_manager.record_win()
+                    log.info("T%d: risk gate recorded WIN (realized PnL: %s)",
+                             self.tick_count, pos_after.realized_pnl)
+                else:
+                    self.risk_manager.record_loss()
+                    log.info("T%d: risk gate recorded LOSS (realized PnL: %s)",
+                             self.tick_count, pos_after.realized_pnl)
+
+        # 8c. Check drawdown against daily loss limit for gate escalation
+        if hasattr(self, '_daily_loss_limit') and self._daily_loss_limit > 0:
+            self.risk_manager.check_drawdown(
+                float(self.risk_manager.state.daily_drawdown), self._daily_loss_limit,
+            )
+
         # 9. Persist state
         self._persist_state()
 
@@ -258,8 +324,21 @@ class TradingEngine:
         if self.guard_bridge is not None and self.guard_bridge.is_active:
             from modules.trailing_stop import GuardAction
             result = self.guard_bridge.check(snapshot.mid_price)
-            if result.action == GuardAction.CLOSE:
-                log.warning("GUARD CLOSE: %s", result.reason)
+            _CLOSE_ACTIONS = {GuardAction.CLOSE, GuardAction.PHASE1_TIMEOUT, GuardAction.WEAK_PEAK_CUT}
+            if result.action in _CLOSE_ACTIONS:
+                _labels = {
+                    GuardAction.CLOSE: "GUARD CLOSE",
+                    GuardAction.PHASE1_TIMEOUT: "PHASE1 TIMEOUT (90min no-graduation)",
+                    GuardAction.WEAK_PEAK_CUT: "WEAK PEAK CUT (45min, peak ROE < 3%)",
+                }
+                label = _labels.get(result.action, result.action.value)
+                elapsed_s = ((time.time() * 1000 - result.state.phase1_start_ts) / 1000
+                             if result.state.phase1_start_ts else 0)
+                log.warning("%s: %s | roe=%.2f%% high_water=%.4f elapsed=%.0fs",
+                            label, result.reason,
+                            result.state.current_roe,
+                            result.state.high_water,
+                            elapsed_s)
                 self._guard_close_position(snapshot)
                 self.guard_bridge.mark_closed(snapshot.mid_price, result.reason)
                 self._running = False
@@ -412,7 +491,7 @@ class TradingEngine:
             risk_ok=ok,
             reduce_only=self.risk_manager.state.reduce_only,
         )
-        print(line, file=sys.stderr)
+        log.info(line)
 
     def _preflight_check(self) -> None:
         """Verify account has funds before starting. Warns loudly if not."""
@@ -482,7 +561,7 @@ class TradingEngine:
             self.tick_count, stats["total_placed"], stats["total_filled"],
             total_pnl, elapsed,
         )
-        print(summary, file=sys.stderr)
+        log.info(summary)
         self.state_db.close()
 
     def _persist_state(self):

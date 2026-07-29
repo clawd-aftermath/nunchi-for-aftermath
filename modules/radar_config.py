@@ -82,4 +82,12 @@ RADAR_PRESETS: Dict[str, RadarConfig] = {
         top_n_deep=30,
         score_threshold=120,
     ),
+    # Tuned for 3-market yex testnet competition. v2 (2026-04-09): raised
+    # score threshold from 80 to 100 to filter out noise-quality scans that
+    # were producing losing entries under the v1 cohort run.
+    "competition": RadarConfig(
+        min_volume_24h=50_000.0,    # was 500_000
+        top_n_deep=10,              # was 20 — yex only has 3 markets so 10 is generous
+        score_threshold=100,        # v2: was 80 (default 150)
+    ),
 }

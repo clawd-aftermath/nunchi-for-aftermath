@@ -12,13 +12,26 @@ import signal
 import subprocess
 import sys
 import time
-from functools import partial
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from pathlib import Path
+from types import SimpleNamespace
 from threading import Thread
+from typing import Any, Optional
 
+import logging
+import re
+
+log = logging.getLogger("entrypoint")
 START_TIME = time.time()
 CHILD_PROC: subprocess.Popen | None = None
+MAX_BODY_SIZE = 1_048_576  # 1MB max POST body
+AUTH_TOKEN = os.environ.get("API_AUTH_TOKEN")
+from cli.mcp_runner import MCP_PATHS, handle_mcp_json_rpc
+
+
+# Regex to redact hex private keys (0x + 64 hex chars)
+_SECRET_RE = re.compile(r'0x[a-fA-F0-9]{64}')
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -31,7 +44,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "mode": os.environ.get("RUN_MODE", "apex"),
                 "uptime_s": int(time.time() - START_TIME),
                 "pid": CHILD_PROC.pid if CHILD_PROC else None,
-                "alive": CHILD_PROC.poll() is None if CHILD_PROC else False,
+                "alive": runner_alive(),
             })
             self._json_response(body)
 
@@ -56,8 +69,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 body = json.dumps(read_status(data_dir))
             except Exception as e:
                 body = json.dumps({"status": "error", "error": str(e)})
-            self._cors_headers()
-            self._json_response(body)
+            self._json_response(body, cors=True)
 
         elif self.path == "/api/strategies":
             try:
@@ -65,15 +77,14 @@ class HealthHandler(BaseHTTPRequestHandler):
                 body = json.dumps(read_strategies())
             except Exception as e:
                 body = json.dumps({"error": str(e)})
-            self._cors_headers()
-            self._json_response(body)
+            self._json_response(body, cors=True)
 
         elif self.path == "/api/feed":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
-            self._cors_headers(headers_only=True)
+            self._send_cors_headers()
             self.end_headers()
             data_dir = os.environ.get("DATA_DIR", "/data")
             try:
@@ -100,8 +111,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 body = json.dumps(read_trades(data_dir, limit=limit))
             except Exception as e:
                 body = json.dumps({"error": str(e)})
-            self._cors_headers()
-            self._json_response(body)
+            self._json_response(body, cors=True)
 
         elif self.path == "/api/reflect":
             data_dir = os.environ.get("DATA_DIR", "/data")
@@ -110,7 +120,19 @@ class HealthHandler(BaseHTTPRequestHandler):
                 body = json.dumps(read_reflect(data_dir))
             except Exception as e:
                 body = json.dumps({"error": str(e)})
-            self._cors_headers()
+            self._json_response(body, cors=True)
+
+        elif self.path == "/metrics":
+            data_dir = os.environ.get("DATA_DIR", "/data")
+            metrics_path = Path(data_dir) / "apex" / "metrics.json"
+            try:
+                if metrics_path.exists():
+                    with open(metrics_path) as f:
+                        body = f.read()
+                else:
+                    body = json.dumps({"status": "no_metrics_yet"})
+            except Exception as e:
+                body = json.dumps({"error": str(e)})
             self._json_response(body)
 
         elif self.path == "/api/scanner":
@@ -120,8 +142,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 body = json.dumps(read_radar(data_dir))
             except Exception as e:
                 body = json.dumps({"error": str(e)})
-            self._cors_headers()
-            self._json_response(body)
+            self._json_response(body, cors=True)
 
         elif self.path.startswith("/api/journal"):
             data_dir = os.environ.get("DATA_DIR", "/data")
@@ -133,56 +154,96 @@ class HealthHandler(BaseHTTPRequestHandler):
                 body = json.dumps(read_journal(data_dir, limit=limit))
             except Exception as e:
                 body = json.dumps({"error": str(e)})
-            self._cors_headers()
-            self._json_response(body)
+            self._json_response(body, cors=True)
 
         else:
             self.send_response(404)
             self.end_headers()
 
+    def _check_auth(self) -> bool:
+        """Check bearer token auth if API_AUTH_TOKEN is configured."""
+        if not AUTH_TOKEN:
+            return True  # no auth configured
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header == f"Bearer {AUTH_TOKEN}":
+            return True
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.write(json.dumps({"error": "unauthorized"}))
+        return False
+
+    def _read_body(self) -> bytes | None:
+        """Read POST body with size limit. Returns None if too large."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > MAX_BODY_SIZE:
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.write(json.dumps({"error": "request body too large", "max_bytes": MAX_BODY_SIZE}))
+            return None
+        return self.rfile.read(content_length)
+
     def do_POST(self):
-        if self.path == "/api/skill/install":
+        if self.path in MCP_PATHS:
+            body = self._read_body()
+            if body is None:
+                return
+            if os.environ.get("MCP_PROXY_MODE", "runner").lower() == "fastmcp":
+                from cli.mcp_http_proxy import forward_mcp_json_rpc
+                status, response = forward_mcp_json_rpc(body, self.headers)
+            else:
+                status, response = handle_mcp_json_rpc(body, self.headers)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.write(json.dumps(response))
+
+        elif self.path == "/api/skill/install":
             try:
                 from cli.api.status_reader import read_strategies
                 data = read_strategies()
                 count = len(data.get("strategies", {}))
-                self._cors_headers()
-                self._json_response(json.dumps({"installed": True, "strategies": count, "tools": 13}))
+                self._json_response(json.dumps({"installed": True, "strategies": count, "tools": 13}), cors=True)
             except Exception as e:
                 self.send_response(500)
-                self._cors_headers()
+                self._send_cors_headers()
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.write(json.dumps({"installed": False, "error": str(e)}))
 
         elif self.path == "/api/configure":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
+            if not self._check_auth():
+                return
+            body = self._read_body()
+            if body is None:
+                return
             try:
                 config = json.loads(body)
                 data_dir = os.environ.get("DATA_DIR", "/data")
                 from cli.api.status_reader import write_config_override
                 write_config_override(data_dir, config)
-                self._cors_headers()
-                self._json_response(json.dumps({"status": "ok", "applied_at": "next_tick"}))
+                self._json_response(json.dumps({"status": "ok", "applied_at": "next_tick"}), cors=True)
             except Exception as e:
                 self.send_response(400)
-                self._cors_headers()
+                self._send_cors_headers()
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.write(json.dumps({"error": str(e)}))
 
         elif self.path == "/api/pause":
+            if not self._check_auth():
+                return
             if CHILD_PROC and CHILD_PROC.poll() is None:
                 os.kill(CHILD_PROC.pid, signal.SIGSTOP)
-            self._cors_headers()
-            self._json_response(json.dumps({"status": "paused"}))
+            self._json_response(json.dumps({"status": "paused"}), cors=True)
 
         elif self.path == "/api/resume":
+            if not self._check_auth():
+                return
             if CHILD_PROC and CHILD_PROC.poll() is None:
                 os.kill(CHILD_PROC.pid, signal.SIGCONT)
-            self._cors_headers()
-            self._json_response(json.dumps({"status": "resumed"}))
+            self._json_response(json.dumps({"status": "resumed"}), cors=True)
 
         else:
             self.send_response(404)
@@ -191,19 +252,21 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         """Handle CORS preflight."""
         self.send_response(204)
-        self._cors_headers()
+        self._send_cors_headers()
         self.end_headers()
 
     def write(self, body: str):
         self.wfile.write(body.encode())
 
-    def _json_response(self, body: str):
+    def _json_response(self, body: str, cors: bool = False):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        if cors:
+            self._send_cors_headers()
         self.end_headers()
         self.write(body)
 
-    def _cors_headers(self, headers_only: bool = False):
+    def _send_cors_headers(self):
         origin = os.environ.get("CORS_ORIGIN", "*")
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -235,8 +298,20 @@ def build_command() -> list[str]:
         tick = os.environ.get("TICK_INTERVAL")
         if tick:
             cmd += ["--tick", tick]
-        data_dir = os.environ.get("DATA_DIR", "/data/apex")
-        cmd += ["--data-dir", data_dir]
+        # Restrict the agent's pulse/radar scans and entries to a set of
+        # markets. Critical for PR-3 dedicated-wallet mode where the agent
+        # is funded on a HIP-3 dex (e.g. yex) and must NOT scan universal
+        # HL perps that it has no collateral on. Without this, agents
+        # scan 207+ universal markets and produce zero entries even though
+        # they hold $1000 in their yex clearinghouse.
+        allowed = os.environ.get("ALLOWED_INSTRUMENTS")
+        if allowed:
+            cmd += ["--markets", allowed]
+        strategy_names = os.environ.get("STRATEGY_NAMES")
+        if strategy_names:
+            cmd += ["--strategy-names", strategy_names]
+        base_dir = os.environ.get("DATA_DIR", "/data")
+        cmd += ["--data-dir", f"{base_dir}/apex"]
         if os.environ.get("HL_TESTNET", "true").lower() == "false":
             cmd.append("--mainnet")
         return cmd
@@ -254,15 +329,22 @@ def build_command() -> list[str]:
         return py + ["mcp", "serve", "--transport", "sse"]
 
     else:
-        print(f"Unknown RUN_MODE: {mode}. Use apex, wolf, strategy, or mcp.", file=sys.stderr)
+        log.error("Unknown RUN_MODE: %s. Use apex, wolf, strategy, or mcp.", mode)
         sys.exit(1)
+
+
+def runner_alive() -> bool:
+    if CHILD_PROC is not None:
+        return CHILD_PROC.poll() is None
+    return os.environ.get("RUN_MODE", "apex").lower() == "mcp"
+
 
 
 def shutdown(signum, frame):
     """Forward shutdown signal to child process."""
     global CHILD_PROC
     if CHILD_PROC and CHILD_PROC.poll() is None:
-        print(f"[entrypoint] Received signal {signum}, forwarding to child (pid={CHILD_PROC.pid})")
+        log.info("Received signal %d, forwarding to child (pid=%d)", signum, CHILD_PROC.pid)
         CHILD_PROC.send_signal(signal.SIGTERM)
         try:
             CHILD_PROC.wait(timeout=15)
@@ -274,13 +356,27 @@ def shutdown(signum, frame):
 def main():
     global CHILD_PROC
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    # Competition mode: force testnet regardless of other config
+    if os.environ.get("COMPETITION_MODE", "").lower() == "true":
+        os.environ["HL_TESTNET"] = "true"
+        log.info("COMPETITION_MODE active — forcing testnet")
+
     port = int(os.environ.get("PORT", "8080"))
 
-    # Start health check server in background
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    # Start health check server in background (threaded to handle SSE + concurrent requests)
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+    server = ThreadedHTTPServer(("0.0.0.0", port), HealthHandler)
     health_thread = Thread(target=server.serve_forever, daemon=True)
     health_thread.start()
-    print(f"[entrypoint] Health server listening on :{port}")
+    log.info("Health server listening on :%d", port)
 
     # Register signal handlers
     signal.signal(signal.SIGTERM, shutdown)
@@ -298,20 +394,26 @@ def main():
                 [sys.executable, "-m", "cli.main", "builder", "approve", "--yes"] + mainnet_flag,
                 capture_output=True, timeout=30,
             )
-            print("[entrypoint] Builder fee approval sent")
+            log.info("Builder fee approval sent")
         except Exception:
             pass  # best-effort
 
+    mode = os.environ.get("RUN_MODE", "apex")
+    if mode.lower() == "mcp":
+        log.info("Starting mcp mode: HTTP JSON-RPC wrapper active on /mcp/trading")
+        while True:
+            time.sleep(3600)
+
     # Build and run main command
     cmd = build_command()
-    mode = os.environ.get("RUN_MODE", "apex")
-    print(f"[entrypoint] Starting {mode} mode: {' '.join(cmd)}")
+    safe_cmd = _SECRET_RE.sub("0x[REDACTED]", ' '.join(cmd))
+    log.info("Starting %s mode: %s", mode, safe_cmd)
 
     CHILD_PROC = subprocess.Popen(cmd)
 
     # Wait for child to finish (or be killed)
     rc = CHILD_PROC.wait()
-    print(f"[entrypoint] Process exited with code {rc}")
+    log.info("Process exited with code %d", rc)
     sys.exit(rc)
 
 

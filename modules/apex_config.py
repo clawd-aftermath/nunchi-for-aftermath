@@ -85,11 +85,36 @@ class ApexConfig:
     smart_money_conviction_threshold: int = 2
     smart_money_poll_interval_ticks: int = 5
 
+    # Directional strategy integration
+    strategy_enabled: bool = False
+    strategy_names: List[str] = field(default_factory=list)
+    strategy_interval_ticks: int = 1  # Run every N ticks (1 = every tick)
+
     # Order type optimization (ALO fee savings ~3 bps round-trip)
     entry_order_type: str = "Alo"  # "Alo" (maker rebate), "Gtc", or "Ioc"
 
+    # Multi-strategy wallets (opt-in: empty dict = single-wallet mode)
+    wallet_config: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     # Instrument filters
     excluded_instruments: List[str] = field(default_factory=list)
+    allowed_instruments: List[str] = field(default_factory=list)
+
+    # Strategy confidence threshold — separate from pulse so strategies
+    # can enter trades even when pulse is disabled (threshold=95).
+    strategy_confidence_threshold: float = 50.0
+
+    # Signal direction flip — when True, invert all entry directions
+    # (long→short, short→long).  On thin markets like YEX BTCSWP, pulse
+    # signals (FUNDING_FLIP, VOLUME_SURGE, OI_DELTA) fire at move *exhaustion*,
+    # not initiation.  Flipping direction converts a 0% win-rate signal set
+    # into a mean-reversion strategy.
+    flip_signal_direction: bool = False
+
+    # Preset name (optional). When set, the standalone runner uses this to
+    # look up matching pulse/radar presets in PULSE_PRESETS / RADAR_PRESETS
+    # at boot. Set automatically by `apex run --preset <name>` via _run_apex.
+    preset_name: str = ""
 
     def __post_init__(self):
         if self.margin_per_slot == 0.0:
@@ -138,5 +163,52 @@ APEX_PRESETS: Dict[str, ApexConfig] = {
         radar_score_threshold=150,
         pulse_confidence_threshold=60.0,
         daily_loss_limit=1000.0,
+    ),
+    # Tuned for testnet competitions on the yex HIP-3 dex with 3 markets
+    # (VXX, US3M, BTCSWP). Pair with --markets VXX-USDYP,US3M-USDYP,BTCSWP-USDYP.
+    #
+    # Tuning history:
+    #   v1 (2026-04-08): leverage=15, radar=110, pulse=45, min_hold=10min,
+    #     daily_loss=2000. Demonstrated agents trade but every cohort agent
+    #     bled $100-$440 in the first hour because the high leverage + low
+    #     entry threshold + 10-min churn was a losing combination on the
+    #     low-liquidity yex markets.
+    #
+    #   v2 (2026-04-09): drop leverage to 5x, raise entry thresholds, longer
+    #     min hold, much tighter daily loss limit so losing agents pause
+    #     instead of bleeding through their entire balance.
+    #
+    #   v3 (2026-04-09): Phase 0 of profitability roadmap. Baseline snapshot
+    #     showed 0/14 agents profitable, fleet PnL -$9.4k. Root cause: exit
+    #     logic structurally asymmetric. Hard stop at -5% ROE on 5x lev = -1%
+    #     price move; +0.5% entry slippage + fees meant positions stopped on
+    #     noise within minutes, while stagnation TP at +3% ROE was blocked
+    #     by the 30-min min_hold. v3 fixes:
+    #       - leverage 5x → 3x (more headroom per stop)
+    #       - max_negative_roe -5% → -10% (wider stop, ~3.3% price at 3x)
+    #       - SLIPPAGE_FACTOR 1.005 → 1.002 (in hl_adapter.py)
+    #       - stagnation TP allowed to fire during min_hold (apex_engine.py)
+    "competition": ApexConfig(
+        max_slots=3,
+        leverage=3.0,                     # v3: 5.0 → 3.0 (more headroom per stop)
+        max_negative_roe=-10.0,           # v3: -5.0 → -10.0 (~3.3% price at 3x lev)
+        flip_signal_direction=False,       # v5: reverted — signals are noise, not inverted
+        # v6: Pulse/radar have no directional edge on YEX (100+ trades, 0% WR).
+        # Strategy system takes over: per-agent strategies via STRATEGY_NAMES env.
+        radar_score_threshold=9999,       # disabled — no edge
+        pulse_confidence_threshold=95.0,  # disabled — pulse has no edge on YEX
+        strategy_confidence_threshold=50.0,  # strategies have their own threshold
+        strategy_enabled=True,            # v6: enable strategy system
+        strategy_interval_ticks=3,        # v6.6: scan every 3 min — 429 retry makes this safe
+        reflect_auto_adjust=False,        # disable — fights manual tuning
+        radar_interval_ticks=5,           # still scanning for attribution data
+        min_hold_ms=1_800_000,            # v2: was 600_000 (10min) -> 30 min
+        slot_cooldown_ms=60_000,          # 1 min instead of 5
+        daily_loss_limit=200.0,           # v2: was 2000 — pause losing agents fast
+        # Force IOC orders so entries cross the spread and fill immediately.
+        # The default ALO posts limit orders that almost never fill on the
+        # low-liquidity yex markets and the runner cancels them after one
+        # tick. IOC trades the maker rebate for guaranteed fills.
+        entry_order_type="Ioc",
     ),
 }

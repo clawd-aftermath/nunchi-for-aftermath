@@ -21,12 +21,12 @@
   <img src="https://img.shields.io/badge/strategies-14-C9A84C" alt="Strategies" />
   <img src="https://img.shields.io/badge/tests-483%20passing-brightgreen" alt="Tests" />
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License" />
-  <img src="https://img.shields.io/badge/MCP-16%20tools-8A2BE2" alt="MCP" />
+  <img src="https://img.shields.io/badge/MCP-24%20tools-8A2BE2" alt="MCP" />
 </p>
 
 <p align="center">
-  <a href="https://railway.com/new/template?template=https://github.com/Nunchi-trade/agent-cli&envs=HL_PRIVATE_KEY,HL_TESTNET,RUN_MODE,APEX_PRESET&HL_TESTNETDefault=true&RUN_MODEDefault=apex&APEX_PRESETDefault=default">
-    <img src="https://railway.com/button.svg" alt="Deploy on Railway" height="36" />
+  <a href="https://auth.nunchi.trade">
+    <img src="https://img.shields.io/badge/Launch%20via-Nunchi%20Auth-C9A84C" alt="Launch via Nunchi Auth" height="36" />
   </a>
 </p>
 
@@ -75,127 +75,252 @@ hl run engine_mm -i ETH-PERP --tick 10 --mainnet
 hl apex run --mainnet
 ```
 
+### Funding Hedge
+
+Propose a read-only BTCSWP funding-rate hedge from the CLI or any MCP client. The default `hl hedge propose` path reads the current account position; passing `--perp-notional` switches to pure sizing mode with no account fetch or order execution.
+
+```bash
+hl hedge info --json
+hl hedge propose --asset BTC --side long --perp-notional 150000 --funding-apr 42
+hl hedge propose --asset BTC --side long --perp-notional 150000 --funding-rate-8h 0.0003 --json
+hl hedge backtest --csv funding.csv --asset BTC --side long --perp-notional 150000
+```
+
+Backtest CSVs need a `funding_rate_8h`, `perp_funding_rate_8h`, `funding_rate`, or `rate` column. Add `hedge_rate_8h`, `btcswp_rate_8h`, or `btcswp_funding_rate_8h` when you have realized BTCSWP rates; otherwise the backtest uses an idealized offset.
+
+MCP tools: `funding_hedge_info`, `funding_hedge_propose`, `funding_hedge_backtest`
+
 ---
 
 ## Aftermath Finance (Sui)
 
-All 14 strategies can run on [Aftermath Finance](https://aftermath.finance) perpetuals on Sui instead of Hyperliquid. The `AftermathProxy` is a drop-in replacement for the Hyperliquid proxy — strategy code is unchanged.
+Every strategy in this repository runs on Aftermath Finance perpetuals on Sui.
+There is no Hyperliquid in the Aftermath execution path — Aftermath is the
+venue, not a facade over another one.
 
-### Setup
+One adapter (`cli/af/`) exposes the same interface the engine already used, so
+**strategy code is unchanged**. Add a wallet and go.
 
-```bash
-# 1. Install the Node.js signing helper (one-time)
-cd cli && npm install && cd ..
+> **Nothing is armed.** Strategies ship disabled and this build carries no
+> signer, so no transaction can be signed or submitted. See
+> [Arming](#arming) below.
 
-# 2. Install Python deps
-pip install -r requirements-af.txt    # optional: PyNaCl, bech32
-
-# 3. Set env vars
-export SUI_PRIVATE_KEY=suiprivkey1...    # or base64 Ed25519 key
-export AF_BASE_URL=https://aftermath.finance
-```
-
-### Usage
+### Quickstart
 
 ```bash
-# Mock mode (no real transactions)
-hl af avellaneda_mm -i ETH-AF-PERP --mock --max-ticks 3
+# 1. Install dependencies (base + the additive Aftermath extras)
+pip install -r requirements.txt
+pip install -r requirements-af.txt
 
-# Live mode
-hl af engine_mm -i BTC-AF-PERP --tick 10
+# 2. Configure — copy the template and edit one line
+cp .env.example .env
+#    set AF_WALLET_ADDRESS to your Sui address
 
-# Any strategy works — same interface as HL
-hl af grid_mm -i SUI-AF-PERP --tick 15
-hl af simple_mm -i XAG-AF-PERP --tick 10
+# 3. Preflight. This is the first thing to run; it exits non-zero on failure.
+nunchi doctor
+
+# 4. Run any strategy offline — no network, no keys
+nunchi af simple_mm -i ETH-AF-PERP --mock --max-ticks 5
 ```
+
+`nunchi doctor` prints a pass/fail table covering the API host, spec
+compatibility, wallet, account discovery, gas mode and its prerequisites,
+market resolution and arming posture.
+
+### The API
+
+| | |
+|---|---|
+| Base URL | `https://v2-preview.aftermath.finance` |
+| Override | `AF_API_BASE_URL` |
+| Defined in | `cli/af/config.py` — **the one host constant** |
+
+That hostname **is production mainnet**, despite reading like a staging
+environment. The legacy v1 API host is retired and no longer serves the API at
+all, so anything still pointed at it fails silently rather than loudly.
+
+Every call site reads the single constant, and
+`tests/test_af_v2_hosts.py` fails the build if a second hostname appears
+anywhere in the tree.
+
+### Gas is your choice
+
+One setting, three modes. The default requires no SUI at all.
+
+| `AF_GAS_MODE` | Who pays | Needs |
+|---|---|---|
+| `sponsored` *(default)* | A gas pool, via `/api/gas-pool/*` | A pool granted to your wallet |
+| `self` | Your own SUI | SUI in the wallet |
+| `dynamic` | Any coin you choose, via `/api/dynamic-gas` | `AF_GAS_COIN_TYPE` |
+
+In `dynamic` mode you also choose **which coin pays** — set `AF_GAS_COIN_TYPE`
+to e.g. the USDC coin type to pay gas in USDC.
+
+The gas budget is always set explicitly (`AF_GAS_BUDGET_MIST`); auto-estimation
+under-counts the storage cost of created objects and surfaces later as
+`InsufficientGas` on a transaction that simulated cleanly. `doctor` validates
+the active mode's prerequisites and never silently switches modes.
 
 ### Instrument naming
 
-| AF-style (preferred) | Also accepted |
+| Canonical | Also accepted |
 |---|---|
-| `ETH-AF-PERP` | `ETH-PERP`, `ETH`, `ETH/USD:USD` |
+| `ETH-AF-PERP` | `ETH-PERP`, `ETH`, `ETH/USDC:USDC` |
 | `BTC-AF-PERP` | `BTC-PERP`, `BTC` |
-| `XAG-AF-PERP` | `XAG-PERP`, `XAG` |
+
+Market **ids** are on-chain object ids resolved from
+`/api/perpetuals/all-markets` and validated strictly by the API. They are never
+constructed from a ticker, and there is no dex-local asset-id arithmetic or
+`xyz:` namespace prefix — those are Hyperliquid concepts and are gone.
+
+### Isolated margin
+
+Aftermath is **isolated margin**. Unallocated account collateral protects
+nothing:
+
+```
+wallet USDC -> deposit -> account (unallocated) -> ALLOCATE -> position margin
+```
+
+The adapter performs allocation itself (`_ensure_collateral_allocated`), so
+strategies written against a cross-margin venue keep working without knowing
+about it.
+
+### Atomic operations
+
+The adapter uses Aftermath's multi-operation primitives rather than issuing one
+transaction per action:
+
+| Operation | Transactions | Why |
+|---|---|---|
+| Requote (cancel + replace) | **1** | `cancel-and-place-orders`. A split cancel-then-place leaves the strategy unquoted or double-quoted in between, and can fail halfway. |
+| Price ladder | **1** | `place-scale-order`. N placements costs N gas payments and can leave a half-built grid. |
+| Cancel batch | **1** | `cancel-orders` takes a market→orders map. |
+
+### Arming
+
+Nothing trades until you say so, explicitly:
+
+```bash
+export AF_ARMED=true      # and wire a signer
+```
+
+Every mutating path funnels through one method (`AftermathProxy._submit`), so
+there is exactly one place enforcing this and exactly one place to audit.
+Builds, previews and inspections all run normally while disarmed — which is
+what makes the pipeline verifiable without broadcasting anything.
+
+### Transaction pipeline
+
+```
+build -> preview gate -> INSPECT -> (sign) -> reconcile
+```
+
+- **Preview gate** — where a `previews/*` counterpart exists it runs first, and
+  a preview error blocks the build entirely. Previews can return HTTP 200 with
+  an error body, so they are parsed as tagged unions and fail closed.
+- **Inspection** — a builder response is untrusted input. Sender, gas
+  configuration, sponsorship and target package are all checked before a
+  signature could exist. The gate is structural: `sign_inspected()` accepts
+  only an `InspectedTx`, and only `inspect()` can produce one.
+- **Reconcile** — a 200 from submit means "accepted", not "applied". State is
+  re-read and compared against intent.
+
+### Safety, in the adapter
+
+These live below the strategy layer so they apply to every strategy at once and
+cannot be bypassed by one that forgets to check:
+
+- **Margin health zones** off the position's API-reported `marginRatio` against
+  `marginRatioMaintenance` — `>2x` safe, `1.5–2x` warning, `1–1.5x` danger,
+  `<1x` liquidation.
+- **Two-tier circuit breakers** — soft limits warn, hard limits halt, and a
+  tripped breaker stays tripped until reset.
+- **Heartbeat kill switch** — no server-side dead-man switch exists, so the bot
+  owns one. Cancellation is *verified* by re-reading the book, never assumed.
+- **SIGINT/SIGTERM** handlers cancel all orders and exit non-zero if any survive.
+- **Serialized writes** — parallel deposits race on Sui object versions.
+- **State refresh after every mutation** — state goes stale the instant a
+  transaction lands.
+
+### Reference skills
+
+The official Aftermath skills (`aftermath-api` v3.0.0) are vendored **verbatim**
+at [`AFTERMATH_SKILLS_REF/`](AFTERMATH_SKILLS_REF/), pinned to an exact upstream
+commit in [`PINNED.md`](AFTERMATH_SKILLS_REF/PINNED.md).
+
+They are kept unedited so the next sync is a diff — which means their
+known-wrong URLs are left in place on purpose.
+[`README-DELTA.md`](AFTERMATH_SKILLS_REF/README-DELTA.md) catalogues every one
+and what this repository does instead. **Take their patterns, never their
+hostnames.**
 
 ### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `SUI_PRIVATE_KEY` | required | Bech32 (`suiprivkey1...`) or base64 Ed25519 key |
-| `AF_BASE_URL` | `https://aftermath.finance` | API base URL |
-| `AF_LEVERAGE` | `5` | Default leverage for new positions |
-| `AF_ACCOUNT_NUMBER` | auto-discovered | Override numeric account ID |
-| `AF_SUI_RPC` | auto (mainnet/testnet) | Sui fullnode RPC URL |
-| `AF_SPONSOR_ADDRESS` | disabled | Primary wallet address for GasPool sponsorship. When set, agent wallet never needs SUI for gas. |
-| `AFTERMATH_WRITE_SETTLE_MS` | `2000` | Delay after each write to prevent stale object races |
+| `AF_WALLET_ADDRESS` | — | Your Sui address (public). The only required value. |
+| `AF_WALLET_KEY` | — | Wallet secret. Only needed to sign; never read by this build. |
+| `AF_API_BASE_URL` | `https://v2-preview.aftermath.finance` | API host |
+| `AF_GAS_MODE` | `sponsored` | `sponsored` \| `self` \| `dynamic` |
+| `AF_GAS_COIN_TYPE` | USDC | Coin that pays gas in `dynamic` mode |
+| `AF_GAS_BUDGET_MIST` | `50000000` | Explicit gas budget (0.05 SUI) |
+| `AF_COLLATERAL_COIN_TYPE` | USDC | Collateral coin; auto-discovered accounts use this |
+| `AF_LEVERAGE` | `5` | Default leverage |
+| `AF_ARMED` | `false` | Master arming switch |
+| `AF_INTEGRATOR_ID` | — | Builder code integrator id (**u32 number** in v3.0.0) |
+| `AF_INTEGRATOR_FEE` | — | Builder code fee share |
+| `AF_HEARTBEAT_TIMEOUT_S` | `90` | Kill-switch silence threshold |
+| `AF_SETTLE_MS` | `1500` | Settle delay after a mutation |
+
+See [`.env.example`](.env.example) for the annotated template.
 
 ### Architecture
 
-The proxy translates the Nunchi engine's calls into Aftermath's native perpetuals API:
-
 ```
-TradingEngine / OrderManager / Guard / Radar / Pulse
+strategies/*  (never touch the venue)
         |
         v
-  AftermathProxy (cli/af_proxy.py)     <-- drop-in for DirectHLProxy
+TradingEngine / OrderManager
         |
         v
-  Aftermath Native API (/api/perpetuals/*)
+AftermathProxy  (cli/af/proxy.py)   <-- the ONE adapter
+        |
+   +----+----+----+----+----+
+   |    |    |    |    |    |
+  api  gas  tx safety ids markets
         |
         v
-  Node.js Sui Signer (cli/_af_node_signer.mjs)
-        |
-        v
-  Sui blockchain (signAndExecuteTransaction)
+Aftermath V2 API (https://v2-preview.aftermath.finance)
 ```
 
-The signing pipeline uses `Transaction.fromKind()` from `@mysten/sui` — the same pattern as the Aftermath TypeScript SDK. All writes are serialized to prevent stale Sui object races.
+`AftermathMockProxy` (`cli/af/mock.py`) is an interface-identical twin, so every
+strategy runs with zero network and zero keys. Parity is enforced by
+`tests/test_af_v2_adapter.py`, not by discipline.
 
-### Optimizations
-
-The proxy uses Aftermath's most efficient patterns:
-
-- **Atomic cancel-and-place**: The `OrderManager` detects the AF proxy and batches all order cancellations + new placements into a single `cancel-and-place-orders` Sui transaction. This saves ~7x gas compared to individual cancel + place calls.
-- **Gasless trading (GasPool)**: Set `AF_SPONSOR_ADDRESS` to a primary wallet that owns a GasPool. The agent wallet never needs SUI — gas is drawn from the pool automatically. Supports depositing USDC into the gas pool (auto-swaps to SUI via Aftermath router).
-- **Auto collateral allocation**: Before the first PostOnly order on a market, the proxy automatically calls `allocate-collateral` to pre-fund the position. No manual collateral management needed.
-- **Correct funding rate**: Uses `premiumTwap / indexPrice` from `/api/perpetuals/all-markets` instead of the inflated `estimatedFundingRate` field.
-- **Position cache**: `hasPosition` is cached for 10s per market to avoid redundant API calls during multi-order ticks. Cache invalidates after every write.
-- **Retry with backoff**: All HTTP calls retry 3x with exponential backoff on 429/5xx/timeout.
-
-### Gasless Trading Setup
-
-To run your bot without holding SUI in the agent wallet:
-
-1. From your primary wallet, create a GasPool: `POST /api/gas-pool/transactions/create`
-2. Deposit SUI or USDC into the pool: `POST /api/gas-pool/transactions/deposit` (USDC auto-swaps to SUI)
-3. Grant your agent wallet access: `POST /api/gas-pool/transactions/grant`
-4. Set `AF_SPONSOR_ADDRESS` to your primary wallet address
-5. Run your strategy — all transactions are now gas-sponsored
-
-See [docs/aftermath/gasless-trading.md](docs/aftermath/gasless-trading.md) for full details.
-
-### Aftermath Perpetuals Documentation
-
-Comprehensive integration docs are included in the repo:
+### Documentation
 
 | Document | Description |
-|----------|-------------|
-| [Gasless Trading](docs/aftermath/gasless-trading.md) | GasPool setup, USDC-as-gas, sponsored transactions |
-| [Market Maker Economics](docs/aftermath/market-maker-economics.md) | Fee tiers, gas costs, PTBs, RGP protection |
-| [Market Makers Guide](docs/aftermath/market-makers.md) | Integration guide, gas optimization tips, example requests |
-| [Agent Wallets](docs/aftermath/agent-wallets.md) | Delegate trading without transferring ownership |
-| [Sub-Accounts](docs/aftermath/sub-accounts.md) | Strategy isolation with shared fee tiers |
-
-### Aftermath Perpetuals Skill
-
-A comprehensive agent skill for Aftermath integration is included at [`skills/aftermath-perpetuals/`](skills/aftermath-perpetuals/SKILL.md). It covers native endpoints, CCXT compatibility, TypeScript SDK, error handling, safety/risk patterns, market making optimization, and gotchas.
+|---|---|
+| [V2 Migration](docs/aftermath/MIGRATION-V2.md) | What changed from v1, strategy coverage, atomic-vs-split |
+| [Gasless Trading](docs/aftermath/gasless-trading.md) | Gas pool setup, USDC-as-gas, sponsored transactions |
+| [Market Maker Economics](docs/aftermath/market-maker-economics.md) | Fee tiers, gas costs, PTBs |
+| [Market Makers Guide](docs/aftermath/market-makers.md) | Integration guide and example requests |
 
 ### Known limitations
 
-- **Trigger orders**: `place_trigger_order` returns a tx digest, not the stop-order object ID. Cancellation requires the object ID from `stop-order-datas` (signed auth).
-- **No WebSocket orderbook**: Uses REST polling per tick. A WS subscription would reduce latency.
-- **APEX multi-slot**: Not yet integration-tested with Aftermath (should work via the same proxy interface).
-- **Not tested on mainnet with real funds**. Mock mode verified; live mode is API-correct but not battle-tested.
+- **Not exercised against live markets.** Aftermath lists no markets yet
+  (pre-relaunch), so trading paths are correct against the spec but unproven
+  against real books. Zero markets is treated as expected and warned about,
+  never as an outage.
+- **No signer ships with this build.** Build, preview and inspect paths run;
+  signing and submission are deliberately absent.
+- **The `/api/wallet/*` family is in the spec but 404s live** — balance lookups
+  degrade gracefully rather than failing.
+- **Trigger-order cancellation** takes a stop-order id from `stop-order-datas`;
+  the create path returns a transaction result, not the object id.
+- **No WebSocket orderbook** — REST polling per tick. The `marketCandles`
+  subscription on `/api/perpetuals/ws/updates` would reduce latency.
 
 ---
 
@@ -241,7 +366,7 @@ Supporting strategies for portfolio management, block liquidity, and autonomous 
 
 | Strategy | Description | Key Parameters | When to Use |
 |----------|-------------|----------------|-------------|
-| `hedge_agent` | Reduces excess exposure per deterministic mandate. Fires when net notional exceeds threshold. | `notional_threshold` | Always-on risk overlay. Pairs with any MM or signal strategy. |
+| `hedge_agent` | Inventory exposure reducer. Fires when net notional exceeds threshold. This is not the BTCSWP funding-rate hedge; use `hl hedge propose` / `hl hedge backtest` for that. | `notional_threshold` | Always-on risk overlay. Pairs with any MM or signal strategy. |
 | `rfq_agent` | Block-size dark RFQ liquidity — quotes for large orders with wider spreads. | `min_size`, `spread_bps` | Institutional/block flow. Provides hidden liquidity for large counterparties. |
 | `claude_agent` | Multi-model LLM trading agent. Sends market snapshot to an LLM (Gemini, Claude, or OpenAI), receives structured trade decisions. | `model`, `base_size` | Experimental/research. Autonomous decision-making using LLM reasoning. |
 
@@ -582,6 +707,9 @@ hl radar run [options]            # Opportunity radar
 hl pulse run [options]            # Pulse momentum detector
 hl guard run -i ETH-PERP [options] # Guard trailing stop
 hl reflect run [--since DATE]        # Performance review
+hl hedge info [--json]             # Funding hedge profiles and schemas
+hl hedge propose [options]         # BTCSWP funding hedge proposal
+hl hedge backtest --csv <path>     # Local funding hedge cashflow backtest
 
 # Infrastructure
 hl builder approve [--mainnet]    # Approve builder fee
@@ -598,76 +726,81 @@ hl mcp serve                      # Start MCP server
 
 Expose all trading tools via [Model Context Protocol](https://modelcontextprotocol.io) for AI agent integration.
 
+### Hosted MCP (Recommended)
+
+Use the hosted Nunchi MCP when you want a Robinhood-style setup: paste one URL into your AI client, authenticate, and grant scoped tool access. Your AI client receives a scoped MCP token, not your exchange private key.
+
+```bash
+https://agent.nunchi.trade/mcp/trading
+```
+
+Client setup:
+
+```bash
+# Cursor
+Settings -> Cursor Settings -> Tools & MCPs -> Connect
+MCP URL: https://agent.nunchi.trade/mcp/trading
+
+# Claude Code
+claude mcp add nunchi-trading --transport http https://agent.nunchi.trade/mcp/trading
+
+# Codex CLI
+codex mcp add nunchi-trading --url https://agent.nunchi.trade/mcp/trading
+```
+
+After connecting, authenticate in the browser consent flow and start with:
+
+```text
+Run setup_check, then show my account status and available strategies.
+```
+
+Hosted access defaults to read-only/testnet. Write tools (`trade`, `run_strategy`, `apex_run`) and mainnet access require explicit consent and gateway-enforced limits.
+
+### Local MCP (Development Only)
+
 ```bash
 hl mcp serve                      # stdio transport (default)
 hl mcp serve --transport sse      # SSE transport
 ```
 
-**16 tools exposed:** `account`, `status`, `trade`, `run_strategy`, `strategies`, `radar_run`, `apex_status`, `apex_run`, `reflect_run`, `setup_check`, `builder_status`, `wallet_list`, `wallet_auto`, `agent_memory`, `trade_journal`, `judge_report`
+**24 tools exposed:** `strategies`, `builder_status`, `wallet_list`, `wallet_auto`, `setup_check`, `funding_hedge_info`, `funding_hedge_propose`, `funding_hedge_backtest`, `account`, `status`, `trade`, `run_strategy`, `radar_run`, `apex_status`, `apex_run`, `reflect_run`, `schedule_cancel`, `emergency_close_all`, `order_status`, `funding_rates`, `agent_memory`, `trade_journal`, `judge_report`, `obsidian_context`
 
-Fast tools (strategies, builder, wallet, setup, memory, journal, judge) call Python directly — zero subprocess overhead.
+Fast tools (strategies, builder, wallet, setup, memory, journal, judge) call Python directly — zero subprocess overhead. Local MCP is for development and agent harness testing only; hosted deployment goes through Nunchi Auth and the subscription-gated hosted-agent flow.
 
 ### HTTP API & SSE
 
 Every deployed agent also exposes an HTTP REST API and SSE real-time feed for dashboards, monitoring, and external integrations. A separate leaderboard microservice tracks agent PnL rankings.
 
-**[Full API Reference →](docs/api-reference.md)**
+**[Full API Reference →](docs/api-reference.md)**  
+**[July 2026 Exhibit A Testing Plan →](docs/EXHIBIT_A_TESTING_PLAN.md)**
 
 ---
 
-## Deploy on Railway
+## Hosted Agent Deployment
 
-Two deployment options: **headless** (APEX runs strategies directly) or **OpenClaw agent** (conversational AI trading assistant with Telegram).
+The only supported hosted deployment path is **Nunchi-hosted**: users pay in web-auth, bind an agent wallet, and Nunchi provisions and manages the agent on Nunchi-owned Railway infrastructure.
 
-### Option A: Headless APEX (Deterministic)
+Start here:
 
-One-click deploy to run APEX autonomously. No AI model needed — pure deterministic strategy execution.
+[Launch a hosted agent through Nunchi Auth](https://auth.nunchi.trade)
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/Nunchi-trade/agent-cli&envs=HL_PRIVATE_KEY,HL_TESTNET,RUN_MODE,APEX_PRESET&HL_TESTNETDefault=true&RUN_MODEDefault=apex&APEX_PRESETDefault=default)
+User flow:
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `HL_PRIVATE_KEY` | Yes | — | Your Hyperliquid private key |
-| `HL_TESTNET` | No | `true` | `true` for testnet, `false` for mainnet |
-| `RUN_MODE` | No | `apex` | `apex`, `wolf` (alias), `strategy`, or `mcp` |
-| `APEX_PRESET` | No | `default` | `conservative`, `default`, or `aggressive` |
+1. Open web-auth and connect a wallet.
+2. Bind or create an agent wallet.
+3. Pay for the hosted-agent subscription with Stripe-supported payment methods or USDC.
+4. Deploy the hosted agent from the wallet binding page.
+5. Refresh status and open the hosted endpoint returned by web-auth.
 
-**Run modes:**
-- **apex** (default) — APEX multi-slot orchestrator with autonomous entry, exit, Guard trailing stops, and REFLECT self-improvement loop
-- **strategy** — Single strategy loop (set `STRATEGY=engine_mm`, `avellaneda_mm`, etc.)
-- **mcp** — MCP server for AI agent integration (SSE transport)
+Hosted agents use Nunchi-owned inference credentials by default:
 
-### Option B: OpenClaw Agent (Conversational AI)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AI_PROVIDER` | `openrouter` | OpenAI-compatible hosted inference |
+| `AI_MODEL` | `openrouter/auto` | Low-latency/cost-aware default for chat and tool use |
+| `NUNCHI_REFLECT_MODEL` | `openrouter/fusion` | Higher-confidence model for REFLECT/research-style analysis |
 
-One-click deploy of a full OpenClaw agent that uses our CLI as the tool backend. Talk to your trading bot via Telegram — it scans markets, enters trades, manages risk, and learns from its mistakes.
-
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/Nunchi-trade/agent-cli/tree/main/deploy/openclaw-railway&envs=HL_PRIVATE_KEY,AI_PROVIDER,AI_API_KEY,TELEGRAM_BOT_TOKEN,TELEGRAM_USERNAME,HL_TESTNET&HL_TESTNETDefault=true)
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `HL_PRIVATE_KEY` | Yes | — | Your Hyperliquid private key |
-| `AI_PROVIDER` | Yes | — | `anthropic`, `openai`, `gemini`, or `openrouter` |
-| `AI_API_KEY` | Yes | — | API key for the chosen AI provider |
-| `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram bot token (from @BotFather) |
-| `TELEGRAM_USERNAME` | Yes | — | Your Telegram @username |
-| `HL_TESTNET` | No | `true` | `true` for testnet, `false` for mainnet |
-
-**What you get:**
-- OpenClaw gateway with web UI at `/openclaw`
-- Telegram integration — chat with your bot to start/stop trading, run scans, check status
-- Our 13 MCP trading tools as the agent's primary capabilities
-- Persistent state across redeploys via `/data` volume
-- Auto-onboard: bot sends "Agent ready" to Telegram on first deploy
-- REFLECT self-improvement: the agent analyzes its own trades and adjusts strategy parameters
-
-**How it works:**
-1. Deploy sets up OpenClaw + our `hl mcp serve` as the tool provider
-2. Bot auto-configures Telegram and sends you a ready message
-3. Tell it "start trading" → it runs APEX with autonomous entry, exit, and risk management
-4. Ask "how did we do?" → it runs REFLECT and reports performance metrics
-5. The agent reads workspace files (AGENTS.md, SOUL.md) that define its trading behavior
-
-Both options persist state via Railway volume at `/data` — APEX state, REFLECT reports, Radar history, and agent memory survive redeploys.
+Users do not need Railway credentials, Railway project access, or provider API keys. Billing, entitlement checks, wallet binding, secret injection, lifecycle controls, and hosted endpoint discovery all live in web-auth. This repository intentionally does not include Dockerfiles, `railway.toml`, or public deployment templates.
 
 ---
 
@@ -694,7 +827,7 @@ hl run engine_mm -i BTCSWP-USDYP --tick 10
 ```
 cli/           CLI commands and trading engine
   commands/    Subcommand modules (run, apex, radar, pulse, guard, reflect, house, ...)
-  mcp_server.py  MCP server (16 tools via FastMCP)
+  mcp_server.py  MCP server (24 tools via FastMCP)
   hl_adapter.py  Direct HL API adapter (live + mock)
   builder_fee.py Builder fee config (HL native BuilderInfo)
   keystore.py    Encrypted keystore (geth-compatible)

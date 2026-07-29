@@ -17,6 +17,7 @@ class ApexSlot:
     direction: str = ""         # "long" or "short"
     entry_source: str = ""      # pulse_immediate, pulse_signal, radar
     entry_signal_score: float = 0.0
+    wallet_id: str = "default"  # multi-wallet: which wallet owns this slot
 
     # Position data
     entry_price: float = 0.0

@@ -11,8 +11,28 @@ mountPath = "/data"
 
 [variables]
 PORT = "8080"
-HL_TESTNET = "true"
 APEX_PRESET = "default"
 RUN_MODE = "apex"
-INSTRUMENT = "ETH-PERP"
 DATA_DIR = "/data"
+
+# ── Aftermath Finance (Sui) ──────────────────────────────────────
+# The venue. Set AF_WALLET_ADDRESS in the Railway dashboard — it is a
+# public address, not a secret. AF_WALLET_KEY, if you add one, belongs
+# in Railway's secret variables and nowhere else.
+
+INSTRUMENT = "ETH-AF-PERP"
+
+# The one host setting. This IS production mainnet despite the name.
+AF_API_BASE_URL = "https://v2-preview.aftermath.finance"
+
+# Gas: sponsored | self | dynamic. Sponsored needs no SUI in the wallet.
+AF_GAS_MODE = "sponsored"
+AF_GAS_BUDGET_MIST = "50000000"
+
+AF_LEVERAGE = "5"
+
+# MASTER ARMING SWITCH — deliberately false.
+# A deployment must be armed explicitly; it never trades on first boot.
+AF_ARMED = "false"
+
+AF_HEARTBEAT_TIMEOUT_S = "90"

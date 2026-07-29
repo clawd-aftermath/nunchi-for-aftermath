@@ -162,6 +162,18 @@ class PositionTracker:
         """Net quantity for the house (positive=long, negative=short)."""
         return self.get_house_position(instrument).net_qty
 
+    def get_wallet_positions(self, wallet_id: str) -> Dict[str, Position]:
+        """Get all positions for a specific wallet (agent_id == wallet_id)."""
+        return dict(self.agent_positions.get(wallet_id, {}))
+
+    def get_wallet_pnl(self, wallet_id: str, mark_prices: Dict[str, Decimal]) -> Decimal:
+        """Total PnL (realized + unrealized) for a specific wallet."""
+        total = ZERO
+        for inst, pos in self.agent_positions.get(wallet_id, {}).items():
+            mp = mark_prices.get(inst, pos.avg_entry_price)
+            total += pos.total_pnl(mp)
+        return total
+
     def get_all_instruments(self) -> List[str]:
         return list(self.house_positions.keys())
 

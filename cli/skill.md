@@ -179,14 +179,14 @@ hl setup bootstrap                   # Auto-create venv and install
 hl setup claim-usdyp                 # Claim testnet USDyP tokens
 ```
 
-### MCP Server (16 Tools)
+### MCP Server (24 Tools)
 
 ```bash
 hl mcp serve                         # Start MCP server (stdio transport)
 hl mcp serve --transport sse         # Start MCP server (SSE transport)
 ```
 
-Tools: `strategies`, `builder_status`, `wallet_list`, `wallet_auto`, `setup_check`, `account`, `status`, `trade`, `run_strategy`, `radar_run`, `apex_status`, `apex_run`, `reflect_run`, `agent_memory`, `trade_journal`, `judge_report`
+Tools: `strategies`, `builder_status`, `wallet_list`, `wallet_auto`, `setup_check`, `funding_hedge_info`, `funding_hedge_propose`, `funding_hedge_backtest`, `account`, `status`, `trade`, `run_strategy`, `radar_run`, `apex_status`, `apex_run`, `reflect_run`, `schedule_cancel`, `emergency_close_all`, `order_status`, `funding_rates`, `agent_memory`, `trade_journal`, `judge_report`, `obsidian_context`
 
 ## Strategies (14)
 
@@ -203,7 +203,7 @@ Tools: `strategies`, `builder_status`, `wallet_list`, `wallet_auto`, `setup_chec
 | mean_reversion | Signal | Trades when price deviates from SMA |
 | momentum_breakout | Signal | Enters on volume + price breakout above/below N-period range |
 | aggressive_taker | Taker | Directional spread crossing with bias |
-| hedge_agent | Risk | Reduces excess exposure per deterministic mandate |
+| hedge_agent | Risk | Inventory exposure reducer; BTCSWP funding hedge lives under `hl hedge` |
 | rfq_agent | RFQ | Block-size dark RFQ liquidity |
 | claude_agent | LLM | Claude/Gemini-powered autonomous trading agent |
 

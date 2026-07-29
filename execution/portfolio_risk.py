@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from common.models import instrument_to_asset
+
 log = logging.getLogger("portfolio_risk")
 
 # Rough correlation groups for crypto assets
@@ -82,7 +84,7 @@ class PortfolioRiskManager:
 
         # 1. Build correlation groups
         for inst, pos in positions.items():
-            coin = inst.replace("-PERP", "").replace("-USDYP", "")
+            coin = instrument_to_asset(inst)
             group = COIN_TO_GROUP.get(coin, f"ungrouped:{coin}")
             if group not in state.correlated_groups:
                 state.correlated_groups[group] = []
@@ -153,7 +155,7 @@ class PortfolioRiskManager:
             return False, state.block_reason
 
         # Check correlation group
-        coin = instrument.replace("-PERP", "").replace("-USDYP", "")
+        coin = instrument_to_asset(instrument)
         group = COIN_TO_GROUP.get(coin)
         if group and group in state.correlated_groups:
             if len(state.correlated_groups[group]) > self.config.max_correlated_positions:
