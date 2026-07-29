@@ -124,22 +124,47 @@ def af_run_cmd(
 
     strategy_instance = strategy_cls(strategy_id=cfg.strategy, **params)
 
-    # Build proxy
-    if mock or dry_run:
-        hl = AftermathMockProxy()
-        mode_label = "DRY RUN" if dry_run else "MOCK"
-    else:
-        hl = AftermathProxy()
-        mode_label = "LIVE (Aftermath)"
+    # Build the adapter.
+    #
+    # Strategies ship DISABLED: unless the process is explicitly armed
+    # (AF_ARMED=true) it runs against the mock, so an accidental `af run`
+    # cannot touch the network or a wallet. Arming is a single documented
+    # flag — turnkey means "no wiring", not "trades on first run".
+    from cli.af.config import load_config
 
-    typer.echo(f"Exchange: Aftermath Finance (Sui)")
+    af_cfg = load_config()
+
+    if mock or dry_run:
+        hl = AftermathMockProxy(config=af_cfg)
+        mode_label = "DRY RUN" if dry_run else "MOCK"
+    elif not af_cfg.armed:
+        hl = AftermathMockProxy(config=af_cfg)
+        mode_label = "MOCK (disarmed — set AF_ARMED=true for live)"
+        typer.secho(
+            "AF_ARMED is not set: running against the mock adapter. "
+            "No network calls, no orders.",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        hl = AftermathProxy(config=af_cfg)
+        mode_label = "LIVE (Aftermath V2)"
+
+    typer.echo("Exchange: Aftermath Finance (Sui)")
     typer.echo(f"Mode:     {mode_label}")
+    typer.echo(f"Gas:      {af_cfg.gas_mode}")
     typer.echo(f"Strategy: {cfg.strategy} -> {strategy_path}")
     typer.echo(f"Instrument: {cfg.instrument}")
     typer.echo(f"Tick interval: {cfg.tick_interval}s")
     if cfg.max_ticks > 0:
         typer.echo(f"Max ticks: {cfg.max_ticks}")
     typer.echo("")
+
+    # SIGINT/SIGTERM cancel all resting orders before exit, and exit non-zero
+    # if any survive, so a supervisor can tell a clean stop from one that left
+    # exposure on the book.
+    from cli.af.safety import install_shutdown_handlers
+
+    install_shutdown_handlers(hl.kill_switch)
 
     from cli.engine import TradingEngine
 
