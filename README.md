@@ -131,17 +131,17 @@ market resolution and arming posture.
 
 | | |
 |---|---|
-| Base URL | `https://v2-preview.aftermath.finance` |
+| Base URL | `https://aftermath.finance` |
 | Override | `AF_API_BASE_URL` |
 | Defined in | `cli/af/config.py` — **the one host constant** |
 
-That hostname **is production mainnet**, despite reading like a staging
-environment. The legacy v1 API host is retired and no longer serves the API at
-all, so anything still pointed at it fails silently rather than loudly.
+That hostname is the launched production mainnet API. The former preview
+deployment still answers but exposes a stale market universe, so it must not be
+used as a fallback.
 
 Every call site reads the single constant, and
-`tests/test_af_v2_hosts.py` fails the build if a second hostname appears
-anywhere in the tree.
+`tests/test_af_v2_hosts.py` pins the production default and fails the build if
+the retired preview hostname appears anywhere in the tracked text surface.
 
 ### Gas is your choice
 
@@ -249,11 +249,9 @@ The official Aftermath skills (`aftermath-api` v3.0.0) are vendored **verbatim**
 at [`AFTERMATH_SKILLS_REF/`](AFTERMATH_SKILLS_REF/), pinned to an exact upstream
 commit in [`PINNED.md`](AFTERMATH_SKILLS_REF/PINNED.md).
 
-They are kept unedited so the next sync is a diff — which means their
-known-wrong URLs are left in place on purpose.
-[`README-DELTA.md`](AFTERMATH_SKILLS_REF/README-DELTA.md) catalogues every one
-and what this repository does instead. **Take their patterns, never their
-hostnames.**
+They are kept unedited so the next sync is a diff. Their production URLs now
+match the launched API host; [`README-DELTA.md`](AFTERMATH_SKILLS_REF/README-DELTA.md)
+records the local host-discipline rules and launch-era differences.
 
 ### Environment variables
 
@@ -261,7 +259,7 @@ hostnames.**
 |---|---|---|
 | `AF_WALLET_ADDRESS` | — | Your Sui address (public). The only required value. |
 | `AF_WALLET_KEY` | — | Wallet secret. Only needed to sign; never read by this build. |
-| `AF_API_BASE_URL` | `https://v2-preview.aftermath.finance` | API host |
+| `AF_API_BASE_URL` | `https://aftermath.finance` | API host |
 | `AF_GAS_MODE` | `sponsored` | `sponsored` \| `self` \| `dynamic` |
 | `AF_GAS_COIN_TYPE` | USDC | Coin that pays gas in `dynamic` mode |
 | `AF_GAS_BUDGET_MIST` | `50000000` | Explicit gas budget (0.05 SUI) |
@@ -291,7 +289,7 @@ AftermathProxy  (cli/af/proxy.py)   <-- the ONE adapter
   api  gas  tx safety ids markets
         |
         v
-Aftermath V2 API (https://v2-preview.aftermath.finance)
+Aftermath V2 API (https://aftermath.finance)
 ```
 
 `AftermathMockProxy` (`cli/af/mock.py`) is an interface-identical twin, so every
@@ -309,10 +307,9 @@ strategy runs with zero network and zero keys. Parity is enforced by
 
 ### Known limitations
 
-- **Not exercised against live markets.** Aftermath lists no markets yet
-  (pre-relaunch), so trading paths are correct against the spec but unproven
-  against real books. Zero markets is treated as expected and warned about,
-  never as an outage.
+- **No live trading verification.** Read-only production discovery returns 15
+  native-USDC markets, but order building, signing, and submission remain
+  unproven against a live book.
 - **No signer ships with this build.** Build, preview and inspect paths run;
   signing and submission are deliberately absent.
 - **The `/api/wallet/*` family is in the spec but 404s live** — balance lookups

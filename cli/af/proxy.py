@@ -394,7 +394,7 @@ class AftermathProxy:
         ]
 
     def get_all_mids(self) -> Dict[str, str]:
-        """Index price per base asset. Empty pre-relaunch, which is expected."""
+        """Index price per base asset. Empty if discovery returns no markets."""
         return {m.symbol: str(m.index_price) for m in self.markets.all()}
 
     # ── Account state ────────────────────────────────────────────

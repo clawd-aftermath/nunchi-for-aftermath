@@ -256,51 +256,55 @@ def test_legacy_af_proxy_imports_still_resolve():
     assert _normalise_instrument("eth") == "ETH-AF-PERP"
 
 
-# ── Wire encoding, verified against the live BTCUSD market (2026-07-28) ──
-# Each of these guards a bug that live data actually exposed. They use the real
-# observed values so a regression is caught without needing the network.
+# ── Wire encoding, sampled from production BTCUSD (2026-08-19) ──
+# This is an offline fixture, not a claim that mutable prices or fees remain
+# current. It preserves the production object/collateral IDs and wire shapes
+# that exposed the covered bugs without requiring network access in the suite.
 
 
-def _live_like_market():
-    """A Market built from the live BTCUSD payload, BigInt strings included."""
+def _production_market_fixture():
+    """A fixed production BTCUSD sample, including BigInt strings."""
     from cli.af.markets import parse_market
 
     return parse_market(
         {
-            "objectId": "0x" + "9f" * 32,
-            "packageId": "0x" + "d6" * 32,
-            "collateralCoinType": "0x1::usdc::USDC",
-            "indexPrice": 63809.56587755,
-            "collateralPrice": 0.99979648,
-            "estimatedFundingRate": 5.03e-05,
-            "nextFundingTimestampMs": 1785240000000,
+            "objectId": "0x05b5c3bea84c4b8f33cf592d899008336dcbae8c9c6c75b2f8e7b8f7878744c1",
+            "packageId": "0x3ec740df8428aa9c93aaef7f8cc1542ac3194fd014826b51bfe245346d64efc7",
+            "collateralCoinType": (
+                "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7"
+                "::usdc::USDC"
+            ),
+            "indexPrice": 68702.18975195,
+            "collateralPrice": 0.99988992,
+            "estimatedFundingRate": -1.32828440761275e-05,
+            "nextFundingTimestampMs": "1787173200000n",
             "marketParams": {
                 "baseAssetSymbol": "BTCUSD",
                 # These arrive as BigInt "…n" STRINGS on the wire.
                 "lotSize": "1n",
-                "tickSize": "100000n",
+                "tickSize": "1000000n",
                 "maxPendingOrders": "80n",
                 "scalingFactor": 1e-06,
-                "marginRatioInitial": 0.1,
-                "marginRatioMaintenance": 0.05,
-                "makerFee": 0.00015,
+                "marginRatioInitial": 0.05,
+                "marginRatioMaintenance": 0.025,
+                "makerFee": -0.00005,
                 "takerFee": 0.00045,
                 "priorityTakerFee": 0.001,
                 "minOrderUsdValue": 1.0,
             },
-            "marketState": {"openInterest": 0.00023},
+            "marketState": {"openInterest": 0.00026823},
         }
     )
 
 
 def test_bigint_response_fields_are_decoded_not_defaulted():
-    """`tickSize` arrives as "100000n"; int() raises and a default would be silent.
+    """`tickSize` arrives as "1000000n"; int() raises and a default would be silent.
 
     Defaulting tickSize to 1 rounds every order price to the wrong grid, and
     the rejection happens on-chain rather than here.
     """
-    m = _live_like_market()
-    assert m.tick_size == 100_000, "tickSize must be decoded from its BigInt string form"
+    m = _production_market_fixture()
+    assert m.tick_size == 1_000_000, "tickSize must be decoded from its BigInt string form"
     assert m.lot_size == 1
     assert m.max_pending_orders == 80
 
@@ -313,12 +317,12 @@ def test_price_and_size_use_the_1e9_fixed_point_not_scaling_factor():
     """
     from cli.af.markets import FIXED_POINT, scale_price, scale_size, unscale
 
-    m = _live_like_market()
+    m = _production_market_fixture()
     assert FIXED_POINT == 10**9
     assert m.scaling_factor == 1e-06  # present, but deliberately not used here
 
     raw_px = scale_price(64108.3049, m)
-    assert raw_px == 64_108_304_900_000
+    assert raw_px == 64_108_304_000_000
     assert raw_px % m.tick_size == 0
     assert unscale(raw_px) == pytest.approx(64108.3049)
 
@@ -330,7 +334,7 @@ def test_price_and_size_use_the_1e9_fixed_point_not_scaling_factor():
 def test_prices_snap_down_to_the_tick_grid():
     from cli.af.markets import scale_price
 
-    m = _live_like_market()
+    m = _production_market_fixture()
     # A price between ticks must land on the grid, never between it.
     assert scale_price(64108.30491234, m) % m.tick_size == 0
 
@@ -355,7 +359,7 @@ def test_orderbook_response_is_nested_one_level_deeper():
     from cli.af import api as apimod
 
     proxy = AftermathProxy(AfConfig(wallet_address="0x" + "11" * 32))
-    m = _live_like_market()
+    m = _production_market_fixture()
 
     nested = {"orderbooks": [{"orderbook": {"bestBidPrice": 1.0, "bestAskPrice": 2.0, "midPrice": 1.5}}]}
     flat = {"orderbooks": [{"bestBidPrice": 1.0, "bestAskPrice": 2.0, "midPrice": 1.5}]}

@@ -12,8 +12,8 @@ break naive code:
 * it is **POST** and requires ``{"collateralCoinType": …}``;
 * it returns ``{"markets": [...]}``, not a bare array.
 
-Pre-relaunch there may be **zero markets**. That is expected, and is warned
-about rather than treated as an outage.
+An empty production response is warned about and leaves trading idle rather
+than being mistaken for a valid market universe.
 
 Ordering note (v3.0.0): the API now guarantees deterministic ordering --
 markets by symbol, positions by market id, bids and asks each by order id. That
@@ -41,7 +41,7 @@ class NoSuchMarket(LookupError):
 
 
 class NoMarketsAvailable(LookupError):
-    """The venue currently lists no markets at all (expected pre-relaunch)."""
+    """The venue returned no markets for the configured collateral type."""
 
 
 @dataclass(frozen=True)
@@ -195,10 +195,10 @@ class MarketRegistry:
             self._fetched_at = time.time()
 
             if not by_id:
-                # Expected pre-relaunch. Warn, never fail.
+                # Warn here; get() raises when a requested market cannot exist.
                 log.warning(
-                    "Aftermath lists no markets for collateral %s. This is expected "
-                    "before the relaunch; trading paths will stay idle.",
+                    "Aftermath lists no markets for collateral %s; trading paths "
+                    "will stay idle.",
                     self.collateral_coin_type,
                 )
             return list(by_id.values())
@@ -212,8 +212,8 @@ class MarketRegistry:
         markets = self.refresh()
         if not markets:
             raise NoMarketsAvailable(
-                "Aftermath lists no markets yet — nothing to trade. "
-                "This is expected before the relaunch."
+                "Aftermath lists no markets for the configured collateral type — "
+                "nothing to trade."
             )
 
         key = str(instrument).strip()

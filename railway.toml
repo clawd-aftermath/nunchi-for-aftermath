@@ -22,8 +22,8 @@ DATA_DIR = "/data"
 
 INSTRUMENT = "ETH-AF-PERP"
 
-# The one host setting. This IS production mainnet despite the name.
-AF_API_BASE_URL = "https://v2-preview.aftermath.finance"
+# The one host setting. This is the launched production mainnet API.
+AF_API_BASE_URL = "https://aftermath.finance"
 
 # Gas: sponsored | self | dynamic. Sponsored needs no SUI in the wallet.
 AF_GAS_MODE = "sponsored"

@@ -1,12 +1,8 @@
-"""The host rule, enforced.
+"""The production-host rule, enforced.
 
-The Aftermath relaunch domain will change. A repository with the hostname
-smeared across forty files is a repository that breaks silently on that day --
-silently, because the retired host does not error, it simply stops being the
-API.
-
-So: exactly one host definition, and a test that fails the build if a second
-one appears.
+Runtime code has one host definition. The launched production host is pinned,
+and the former preview deployment is forbidden because it still answers with a
+stale market universe instead of failing loudly.
 """
 from __future__ import annotations
 
@@ -17,8 +13,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 
-#: Vendored reference material is exempt -- it is pinned upstream content and
-#: is deliberately kept byte-identical. See AFTERMATH_SKILLS_REF/README-DELTA.md.
+#: Vendored reference material is checked separately because it is pinned
+#: upstream content and deliberately kept byte-identical.
 EXEMPT_DIRS = {
     "AFTERMATH_SKILLS_REF",
     ".git",
@@ -28,16 +24,16 @@ EXEMPT_DIRS = {
     "data",
 }
 
-#: Files allowed to name the bare host, because explaining that it is dead is
-#: their entire job.
+#: This file constructs the retired hostname in pieces so repository-wide
+#: literal greps stay useful while the guard can still detect it elsewhere.
 EXEMPT_FILES = {
-    "tests/test_af_v2_hosts.py",  # this file names the dead host to detect it
+    "tests/test_af_v2_hosts.py",
 }
 
 TEXT_SUFFIXES = {".py", ".md", ".json", ".toml", ".yaml", ".yml", ".mjs", ".js", ".ts", ".txt", ".example", ".sh"}
 
-#: The dead v1 host: `aftermath.finance` NOT preceded by `v2-preview.`.
-DEAD_HOST = re.compile(r"(?<!v2-preview\.)(?<!testnet\.)\baftermath\.finance\b")
+PRODUCTION_BASE_URL = "https://aftermath.finance"
+RETIRED_PREVIEW_HOST = "v2-" + "preview." + "aftermath.finance"
 
 
 def _candidate_files():
@@ -54,8 +50,8 @@ def _candidate_files():
         yield rel, path
 
 
-def test_no_dead_v1_host_outside_vendored_skills():
-    """No file may reference the retired `aftermath.finance` API host."""
+def test_no_retired_preview_host_in_repository_text():
+    """No local source, config, example, or documentation may use the old host."""
     offenders = []
     for rel, path in _candidate_files():
         try:
@@ -63,61 +59,58 @@ def test_no_dead_v1_host_outside_vendored_skills():
         except OSError:
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
-            if DEAD_HOST.search(line):
+            if RETIRED_PREVIEW_HOST in line:
                 offenders.append(f"{rel}:{lineno}: {line.strip()[:100]}")
 
     assert not offenders, (
-        "References to the RETIRED v1 host `aftermath.finance` found. "
-        "The live host is https://v2-preview.aftermath.finance and must come "
-        "from cli/af/config.py:AF_API_BASE_URL_DEFAULT.\n  "
+        "References to the retired preview host found. The production host is "
+        f"{PRODUCTION_BASE_URL} and the runtime default must come from "
+        "cli/af/config.py:AF_API_BASE_URL_DEFAULT.\n  "
         + "\n  ".join(offenders)
     )
 
 
-def test_vendored_skills_still_carry_the_trap():
-    """The vendored skills DO name the dead host -- that is expected and documented.
-
-    If this ever goes to zero, upstream fixed their URLs and README-DELTA.md
-    should be updated to say so.
-    """
+def test_vendored_skills_use_the_production_host():
+    """Pinned upstream API references must agree with the launched host."""
     vendored = REPO / "AFTERMATH_SKILLS_REF"
     if not vendored.exists():
         pytest.skip("vendored skills not present")
 
-    hits = 0
+    production_hits = 0
+    retired_hits = []
     for path in vendored.rglob("*"):
         if path.is_file() and path.suffix in TEXT_SUFFIXES:
             text = path.read_text(encoding="utf-8", errors="ignore")
-            hits += len(DEAD_HOST.findall(text))
+            production_hits += text.count(PRODUCTION_BASE_URL)
+            if RETIRED_PREVIEW_HOST in text:
+                retired_hits.append(str(path.relative_to(REPO)))
 
-    assert hits > 0, (
-        "The vendored skills no longer reference the dead host. Upstream may "
-        "have fixed their URLs -- re-sync and update AFTERMATH_SKILLS_REF/README-DELTA.md."
-    )
+    assert production_hits > 0, "vendored skills contain no production API references"
+    assert not retired_hits, f"vendored skills reference the retired preview host: {retired_hits}"
 
 
 def test_exactly_one_host_definition():
-    """The default host literal appears in exactly one place in the source tree."""
+    """The production literal appears in exactly one non-test Python module."""
     definitions = []
     for rel, path in _candidate_files():
         if path.suffix != ".py":
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if "v2-preview.aftermath.finance" in text:
+        if PRODUCTION_BASE_URL in text:
             definitions.append(str(rel))
 
     non_test = [d for d in definitions if not d.startswith("tests/")]
     assert non_test == ["cli/af/config.py"], (
-        f"the V2 host literal must be defined only in cli/af/config.py, found in: {non_test}"
+        f"the production host literal must be defined only in cli/af/config.py, found in: {non_test}"
     )
 
 
-def test_base_url_is_v2_preview_by_default(monkeypatch):
+def test_base_url_is_production_by_default(monkeypatch):
     from cli.af.config import AF_API_BASE_URL, AF_API_BASE_URL_DEFAULT
 
     monkeypatch.delenv("AF_API_BASE_URL", raising=False)
-    assert AF_API_BASE_URL() == "https://v2-preview.aftermath.finance"
-    assert AF_API_BASE_URL_DEFAULT == "https://v2-preview.aftermath.finance"
+    assert AF_API_BASE_URL() == PRODUCTION_BASE_URL
+    assert AF_API_BASE_URL_DEFAULT == PRODUCTION_BASE_URL
 
 
 def test_base_url_is_overridable_without_editing_source(monkeypatch):

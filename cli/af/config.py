@@ -5,18 +5,14 @@ THE HOST RULE
 ``AF_API_BASE_URL`` below is the ONE definition of the Aftermath API host in
 this repository. Every call site reads it; nothing else hardcodes a hostname.
 
-This is a correctness requirement, not a style preference. The relaunch domain
-is expected to change, and a repository with the host smeared across forty files
-is a repository that breaks on that day. ``tests/test_af_v2_hosts.py`` fails the
-build if a reference to the retired v1 host appears anywhere outside the
-vendored reference skills.
+This is a correctness requirement, not a style preference. A repository with
+the host smeared across forty runtime files is a repository that breaks on the
+next migration. ``tests/test_af_v2_hosts.py`` pins the launched production host
+and rejects the retired preview hostname.
 
-Note that the default below IS production mainnet despite the ``v2-preview``
-hostname. The legacy v1 host is retired and no longer serves the API at all --
-pointing at it yields silent staleness, not a clean failure. The vendored
-skills, and even the OpenAPI spec's own ``servers`` block, still name that dead
-host; take their patterns, never their URLs. See
-``AFTERMATH_SKILLS_REF/README-DELTA.md``.
+The production V2 API is served from the main Aftermath domain. The former
+preview deployment still answers but has a stale market universe, so it must
+not be used as a fallback. See ``AFTERMATH_SKILLS_REF/README-DELTA.md``.
 """
 from __future__ import annotations
 
@@ -27,7 +23,7 @@ from typing import Optional
 # ── THE one host constant ────────────────────────────────────────
 #: Aftermath V2 API base URL. Override with ``AF_API_BASE_URL`` in the
 #: environment; never hardcode a host anywhere else.
-AF_API_BASE_URL_DEFAULT = "https://v2-preview.aftermath.finance"
+AF_API_BASE_URL_DEFAULT = "https://aftermath.finance"
 
 
 def AF_API_BASE_URL() -> str:

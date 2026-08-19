@@ -141,7 +141,7 @@ def af_doctor_cmd(
         Check("gas budget", PASS, f"{cfg.gas_budget_mist} MIST ({gasmod.fmt_sui(cfg.gas_budget_mist)}), explicit")
     )
 
-    # 6. Markets resolve. Zero markets pre-relaunch is expected, not a failure.
+    # 6. Markets resolve. An empty response leaves trading unavailable.
     registry = MarketRegistry(cfg.collateral_coin_type)
     markets = []
     try:

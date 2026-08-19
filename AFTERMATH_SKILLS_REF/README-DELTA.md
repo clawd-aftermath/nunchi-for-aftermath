@@ -1,43 +1,24 @@
-# Delta: what these vendored skills get wrong
+# Delta: local integration notes for the vendored skills
 
-The skills in this directory are the authoritative reference for **patterns** —
-safety behaviours, gotchas, error handling, monitoring. Their **URLs are dead**.
+The skills in this directory are the authoritative reference for API patterns,
+safety behaviours, gotchas, error handling, and monitoring. They are pinned at
+`5b614db` and kept byte-identical so an upstream refresh remains reviewable.
 
-Take their patterns. Never their hostnames.
+## Production host
 
-## The trap
+The launched V2 production API is `https://aftermath.finance`. The URLs already
+present in the pinned skills now agree with production and should be used as
+written. The former preview deployment still answers but exposes a stale
+two-market universe; it is not a fallback.
 
-`aftermath-api` v3.0.0 documents V2-only features while still naming the
-**retired v1 host** throughout. As vendored at `5b614db` there are:
+As verified on 2026-08-19, the production `/api/perpetuals/all-markets`
+endpoint returns 15 markets for native Sui USDC. Market object IDs are
+deployment-specific and must always be discovered rather than copied from an
+older environment.
 
-- **22** references to the bare `aftermath.finance` host
-- **0** references to `v2-preview.aftermath.finance`
+### OpenAPI server configuration
 
-Verified as of 2026-07-28: `https://aftermath.finance` no longer serves the API
-at all. Anything pointed there is broken — and broken quietly, which is worse.
-
-### Where they are
-
-| File | What it says |
-|---|---|
-| `skills/api/SKILL.md` | "Production OpenAPI" pointing at the dead host |
-| `skills/api/ccxt.md` | REST base URL, plus `wss://aftermath.finance/...` stream URLs |
-| `skills/api/auxiliary-endpoints.md` | dead host in the endpoint examples |
-| `skills/api/gotchas.md` | dead host in an example |
-| `skills/api/monitoring-patterns.md` | `const BASE_URL = "https://aftermath.finance"`, plus `wss://` URLs |
-| `skills/api/safety-and-risk.md` | the `max-order-size` fetch example |
-| `skills/api/.api-spec-state.json` | the spec URL it tracks |
-
-Reproduce the count:
-
-```sh
-grep -rIo 'aftermath\.finance' AFTERMATH_SKILLS_REF | grep -v 'v2-preview' | wc -l   # 22
-```
-
-### The OpenAPI spec carries the same trap
-
-This bites **code generation** specifically. The live V2 spec's own `servers`
-block reads:
+The V2 spec's `servers` block identifies the production and testnet hosts:
 
 ```json
 "servers": [
@@ -47,25 +28,17 @@ block reads:
 ]
 ```
 
-That "Production server" entry is the **dead v1 host**. Any standard generator
-(`openapi-typescript`, `openapi-generator`, `swagger-codegen`) bakes it in as
-the default base URL, and the resulting client silently talks to a dead API.
-
-If you ever generate a client from the spec: strip or override `servers` first,
-make the generated client read its base URL from the one config constant, then
-grep the output for the bare host and prove it clean.
+Generated clients should still read their base URL from the repository's one
+config constant so future host changes do not require generated-code edits.
 
 ## What this repository does instead
 
 | Concern | This repository |
 |---|---|
-| Host | One constant: `AF_API_BASE_URL_DEFAULT` in `cli/af/config.py`, default `https://v2-preview.aftermath.finance` |
+| Host | One constant: `AF_API_BASE_URL_DEFAULT` in `cli/af/config.py`, default `https://aftermath.finance` |
 | Override | `AF_API_BASE_URL` env var — no source edit needed |
 | Call sites | All go through `cli/af/api.py`, which reads that one constant |
-| Enforcement | `tests/test_af_v2_hosts.py` fails on any bare-host reference outside `AFTERMATH_SKILLS_REF/` |
-
-`https://v2-preview.aftermath.finance` **is production mainnet**, despite the
-hostname. It is not a preview or a testbed.
+| Enforcement | `tests/test_af_v2_hosts.py` pins production and rejects the retired preview hostname |
 
 ## Patterns adopted from these skills
 

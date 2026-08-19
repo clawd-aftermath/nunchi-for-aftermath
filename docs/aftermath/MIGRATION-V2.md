@@ -3,8 +3,8 @@
 What changed when this repository moved from the Aftermath v1 API to V2, and
 from Hyperliquid to Aftermath as the venue.
 
-- **API**: `https://v2-preview.aftermath.finance` (251 paths, 342 schemas).
-  This **is production mainnet** despite the hostname. The v1 host is retired.
+- **API**: `https://aftermath.finance`, the launched production mainnet host.
+  As verified on 2026-08-19, it serves 15 native-USDC perpetual markets.
 - **Skills**: `aftermath-api` v3.0.0, vendored at
   [`AFTERMATH_SKILLS_REF/`](../../AFTERMATH_SKILLS_REF/).
 - **Adapter**: `cli/af_proxy.py` (1,727 lines, v1) → the `cli/af/` package.
@@ -108,7 +108,7 @@ Aftermath.
 | `sendAsset` / `destinationDex` | HL transfers | Gone. Aftermath uses `transfer-collateral` between accounts. |
 | Cross-margin assumption | `crossMarginSummary` in account state | Absent. `capabilities().supports_cross_margin is False`. |
 | `HL_TESTNET`, `INSTRUMENT=ETH-PERP` | `railway.toml` | Replaced with `AF_*` variables and `ETH-AF-PERP`. |
-| `AF_BASE_URL` → dead v1 host | README, env | `AF_API_BASE_URL` → `https://v2-preview.aftermath.finance`. |
+| `AF_BASE_URL` → legacy host setting | README, env | `AF_API_BASE_URL` → `https://aftermath.finance`. |
 | `SUI_PRIVATE_KEY` as the documented secret | README | `AF_WALLET_KEY`; `SUI_PRIVATE_KEY` still read as a fallback. |
 | v1 skill copy at `skills/aftermath-perpetuals/` | in-repo | Removed; superseded by `AFTERMATH_SKILLS_REF/` (v3.0.0). |
 
@@ -176,10 +176,9 @@ Stated plainly rather than approximated:
    raises while disarmed. Build → preview → inspect paths are implemented and
    unit-tested; the sign and reconcile-after-submit legs are unexercised
    against the live chain.
-2. **No live-market verification.** Aftermath lists no markets yet, so all
-   live read paths return empty and no order shape has been round-tripped
-   against a real book. Request shapes come from the spec, not from
-   observation.
+2. **No live trading verification.** A read-only production probe on 2026-08-19
+   returned 15 native-USDC markets, but no order shape has been signed,
+   submitted, or round-tripped against a live book.
 3. **Native TWAP not wired** — see §2.
 4. **Single-PTB onboarding is designed, not implemented.** `create-account`
    with `deferShare` returns deferred PTB argument references
